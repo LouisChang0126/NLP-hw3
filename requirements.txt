@@ -1,0 +1,11 @@
+rank_bm25
+sentence-transformers
+FlagEmbedding
+faiss-cpu
+transformers
+torch
+pandas
+tqdm
+matplotlib
+scikit-learn
+Pillow

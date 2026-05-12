@@ -23,7 +23,7 @@ Setup Checklist (動工前先做)
 [ ] 在每次 run 開頭印出 `config.py` 快照進 log，便於追溯 outputs 目錄對應的設定。
 [ ] deadline：E3 繳交 2026-05-26 23:59（無遲交）；Kaggle 每天最多 5 次提交。
 
-Phase 0: 基礎建設與資料探索 (EDA)
+## Phase 0: 基礎建設與資料探索 (EDA)
 
 [ ] 任務 1：資料讀取。撰寫 `dataset.py`，從 `data/` 目錄讀取 `train.jsonl` (2055) 與 `test.jsonl` (1798)。每筆 sample 解析 `q_id`、`doc_name`、`domain`、`question`、`evidence_modality_type`、`text_quotes`（list of {quote_id, text}）、`img_quotes`（list of {quote_id, img_path, img_description}）、以及 train 才有的 `gold_quotes`。
 
@@ -36,7 +36,7 @@ Phase 0: 基礎建設與資料探索 (EDA)
 
 [ ] 任務 4：驗證影像可讀。隨機抽 20 張 `img_path` 嘗試載入（之後 Phase 2b 會用到），結果寫進 EDA report。
 
-Phase 0.5: 本地驗證框架 (Local Validation)
+## Phase 0.5: 本地驗證框架 (Local Validation)
 
 Kaggle 每天最多 5 次提交、public LB 只佔 30%，**所有實驗都先在本地 dev set 上驗證再上傳**。
 
@@ -48,7 +48,7 @@ Kaggle 每天最多 5 次提交、public LB 只佔 30%，**所有實驗都先在
 
 [ ] 任務 4：維護 `outputs/leaderboard.md`，欄位：phase、model、dev_recall@5、public_LB、submissions_today、備註。每次跑完手動 append。
 
-Phase 1: Simple Baseline (純文字稀疏檢索 BM25)
+## Phase 1: Simple Baseline (純文字稀疏檢索 BM25)
 
 [ ] 任務 1：建立 BM25 檢索器（per-question）。使用 `rank_bm25`，對 **每題自己的候選池** 即時建索引（候選池小，無需 ElasticSearch）。
 
@@ -75,7 +75,7 @@ Phase 1.5: Direct LLM Selection Baseline (Q2 必考)
 
 [ ] 任務 4：輸出 `outputs/phase_direct_llm/{model}_{MMDDHHMM}/submission.csv` 並在 dev 上算 Recall@5、寫 `metrics.json` 和 `leaderboard.md`。
 
-Phase 2: 稠密檢索 (Dense Retrieval)
+## Phase 2: 稠密檢索 (Dense Retrieval)
 
 [ ] 任務 1：模型載入。根據 `config.py` 中的 `PHASE_2_EMBED_MODEL`（建議 `BAAI/bge-m3` 或 `intfloat/multilingual-e5-large`）載入 HuggingFace 模型。
 
@@ -85,7 +85,7 @@ Phase 2: 稠密檢索 (Dense Retrieval)
 
 [ ] 任務 4：dev 評估 + 提交檔。同 Phase 1 任務 3 的格式驗證流程，輸出 `outputs/phase_2/{model}_{MMDDHHMM}/submission.csv` + `metrics.json`，append 到 `leaderboard.md`。
 
-Phase 2b: Multimodal Embedding 檢索 (Q3 必考實驗，10%)
+## Phase 2b: Multimodal Embedding 檢索 (Q3 必考實驗，10%)
 
 報告 Q3 要求對比 **(a) 直接嵌入原始圖片** vs **(b) 圖→文字描述後純文字檢索**。Phase 2 已完成 (b)；本 phase 補齊 (a)。
 
@@ -101,7 +101,7 @@ Phase 2b: Multimodal Embedding 檢索 (Q3 必考實驗，10%)
 
 [ ] (可選加分) 任務 6：用較強 VLM（如 `Qwen2.5-VL-7B-Instruct`，≤80B）對所有 `img_path` 重新生成更精細的 caption，存成 `data/img_description_v2.jsonl`。重跑 Phase 1 / Phase 2 比較原版 vs v2 描述對 Recall@5 的影響。
 
-Phase 3: 混合檢索 (Hybrid Search: BM25 + Dense) - 目標超越 Strong Baseline
+## Phase 3: 混合檢索 (Hybrid Search: BM25 + Dense) - 目標超越 Strong Baseline
 
 [ ] 任務 1：實作 Reciprocal Rank Fusion (RRF)。讀取 Phase 1 (BM25) 與 Phase 2 (Dense) 的 per-question Top-100 排名。`RRF_score(d) = Σ 1/(k + rank_i(d))`，常數 `k=60`。
 
@@ -109,7 +109,7 @@ Phase 3: 混合檢索 (Hybrid Search: BM25 + Dense) - 目標超越 Strong Baseli
 
 [ ] 任務 3：dev 評估 + 提交檔。取 RRF 後 Top-5，沿用 Phase 1 任務 3 的格式驗證，輸出 `outputs/phase_3/{name}_{MMDDHHMM}/submission.csv` 與 `metrics.json`。
 
-Phase 4: SOTA 策略 (Query Expansion + Cross-Encoder Reranking) - 衝擊 Leaderboard 前段班
+## Phase 4: SOTA 策略 (Query Expansion + Cross-Encoder Reranking) - 衝擊 Leaderboard 前段班
 
 [ ] 任務 1：HyDE (Query Expansion)。使用 `config.py` 中的 `PHASE_4_EXPANSION_MODEL`（建議 `Llama-3.1-8B-Instruct` 起跳，資源夠用可上 70B）。將 HyDE prompt 模板（注入 `doc_name` / `domain` / `question`）存到 `prompts/hyde.txt`，供 Q1 報告引用。輸出：`{原 Question} + {假想回答}` 作為新 query，重跑 Phase 3 混合檢索取 Top-100 候選。
 
@@ -117,7 +117,7 @@ Phase 4: SOTA 策略 (Query Expansion + Cross-Encoder Reranking) - 衝擊 Leader
 
 [ ] 任務 3：dev 評估 + 提交檔。Reranker 分數降冪取 Top-5，沿用格式驗證輸出 `outputs/phase_4/{name}_{MMDDHHMM}/submission.csv` 與 `metrics.json`，append `leaderboard.md`。
 
-Phase 5: 分析與報告輔助 (對應 Q1 ~ Q4 全部報告題)
+## Phase 5: 分析與報告輔助 (對應 Q1 ~ Q4 全部報告題)
 
 報告佔 30%（Q1 5%、Q2 5%、Q3 10%、Q4 10%）。本 phase 把前面所有實驗結果彙整成報告素材，最後打包繳交。
 
