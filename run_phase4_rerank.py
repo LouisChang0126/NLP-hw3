@@ -117,16 +117,19 @@ def load_reranker():
     model_name = config.PHASE_4_RERANKER_MODEL
     print(f"📦 Loading reranker: {model_name}")
     
-    from FlagEmbedding import FlagReranker
-    reranker = FlagReranker(model_name, use_fp16=True)
-    return reranker
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, torch_dtype=torch.float16)
+    model = model.to("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval()
+    return model, tokenizer
 
 
 def rerank_per_question(
     query: str,
     candidates: List[dict],
     candidate_ids: List[str],
-    reranker,
+    reranker_tuple,
     top_k: int = 5,
 ) -> List[str]:
     """
@@ -136,11 +139,13 @@ def rerank_per_question(
         query: 查詢文字 (可能已經過 HyDE 擴展)
         candidates: 完整候選池 [{quote_id, modality, text_for_retrieval}]
         candidate_ids: 要重排的 quote_id 列表 (來自 Phase 3 的 Top-100)
-        reranker: FlagReranker instance
+        reranker_tuple: (model, tokenizer)
         top_k: 輸出前幾名
     """
     if not candidate_ids:
         return []
+    
+    model, tokenizer = reranker_tuple
     
     # 建立 id -> text 映射
     id_to_text = {c["quote_id"]: c["text_for_retrieval"] for c in candidates}
@@ -151,14 +156,18 @@ def rerank_per_question(
     for cid in candidate_ids:
         text = id_to_text.get(cid, "")
         if text:
-            pairs.append([query, text])
+            pairs.append([query, text[:1500]]) # 限制長度避免 tokenizer 處理太久
             valid_ids.append(cid)
     
     if not pairs:
         return candidate_ids[:top_k]
     
     # 計算分數
-    scores = reranker.compute_score(pairs)
+    with torch.no_grad():
+        inputs = tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        scores = model(**inputs, return_dict=True).logits.view(-1, ).float().cpu().numpy().tolist()
+    
     if isinstance(scores, (int, float)):
         scores = [scores]
     
