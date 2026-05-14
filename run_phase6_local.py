@@ -40,12 +40,18 @@ GGUF_FILE = os.environ.get("GGUF_FILE", "Qwen3.6-27B-Q6_K.gguf")
 
 # ── 推理參數 ─────────────────────────────────────────
 N_GPU_LAYERS = -1     # -1 = 全部 layers 上 GPU
-N_CTX = 4096          # 我們的 prompt 大概 2000-2500 tokens, 4K 足夠
+# 環境變數可覆寫: N_CTX=8192 CHAR_LIMIT_PER_CANDIDATE=1500 python run_phase6_local.py
+N_CTX = int(os.environ.get("N_CTX", 4096))
 N_BATCH = 512         # prefill 批次大小
 MAX_TOKENS = 64       # 輸出 5 個 IDs + spaces ~ 20-30 tok, 64 給點 margin
 TEMPERATURE = 0.0     # 確定性
 SAVE_EVERY = 25
-CACHE_PATH = os.path.join(config.OUTPUT_DIR, "phase_6_local", "llm_picks_cache.json")
+# 不同 CHAR_LIMIT 用不同 cache, 避免污染
+_CL = int(os.environ.get("CHAR_LIMIT_PER_CANDIDATE", 800))
+CACHE_PATH = os.path.join(
+    config.OUTPUT_DIR, "phase_6_local",
+    f"llm_picks_cache_cl{_CL}.json" if _CL != 800 else "llm_picks_cache.json",
+)
 
 
 # ══════════════════════════════════════════════════════
