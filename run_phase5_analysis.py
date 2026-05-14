@@ -18,7 +18,22 @@ from dataset import (
     split_train_dev, get_gold_quotes_dict,
 )
 from submission_utils import load_rankings
-from run_phase3_hybrid import find_latest_rankings
+
+
+def find_latest_rankings(phase_dir: str, filename: str = "rankings_top100.json") -> str:
+    """在 phase 目錄中找最新的 rankings 檔 (inlined from removed run_phase3_hybrid.py)"""
+    phase_path = os.path.join(config.OUTPUT_DIR, phase_dir)
+    if not os.path.exists(phase_path):
+        return None
+    candidates = []
+    for subdir in os.listdir(phase_path):
+        filepath = os.path.join(phase_path, subdir, filename)
+        if os.path.exists(filepath):
+            candidates.append(filepath)
+    if not candidates:
+        return None
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    return candidates[0]
 
 config.print_config()
 

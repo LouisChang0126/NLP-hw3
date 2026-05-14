@@ -1,9 +1,8 @@
 """
 INLP HW3 Multimodal RAG — 全域設定檔
 
-集中管理所有路徑、模型、超參數。預設值都來自實驗驗證:
-  - Phase 3b/4b 的 LB-best config (current ceiling 0.72650)
-  - VLM caption 的最佳呼叫設定 (enable_thinking=False 等)
+精簡版: 只保留當前 active pipeline (Phase 6 純 LLM 15→5) 所需設定
+        以及報告 Q2/Q3 對照組 (BM25, Dense, Multimodal embedding) 用的 model id.
 """
 import os
 from datetime import datetime
@@ -22,69 +21,69 @@ SAMPLE_SUBMISSION = os.path.join(DATA_DIR, "sample_submission.csv")
 SPLITS_DIR = os.path.join(DATA_DIR, "splits")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "outputs")
 
-# Phase 中產生的副產物
+# VLM caption 副產物 (Q3 報告用)
 IMG_CAPTIONS_VLM_FILE = os.path.join(DATA_DIR, "img_captions_vlm.json")
-STRATIFIED_DEV_IDS_FILE = os.path.join(SPLITS_DIR, "stratified_dev_ids.json")
 
 
 # ══════════════════════════════════════════════════════
 #  Dev split
 # ══════════════════════════════════════════════════════
-DEV_SIZE = 200                  # NOTE: 200 太小, stratified 後每 domain ~67, variance 大
-DEV_SPLIT_STRATEGY = "random"   # "random" | "stratified"
+DEV_SIZE = 200
 
 
 # ══════════════════════════════════════════════════════
-#  共用檢索參數
+#  共用參數
 # ══════════════════════════════════════════════════════
 TOP_K_SUBMIT = 5
-CANDIDATE_POOL_DEPTH = 100      # 每階段保留的 Top-N 候選池深度
-RRF_K = 60                      # Reciprocal Rank Fusion 平滑常數
+CANDIDATE_POOL_DEPTH = 100
 
 
 # ══════════════════════════════════════════════════════
-#  Phase 2: Dense Retrieval
+#  Phase 1: BM25 (Q2 報告對照)
+# ══════════════════════════════════════════════════════
+BM25_TOP_K = TOP_K_SUBMIT
+BM25_TOP_K_LARGE = CANDIDATE_POOL_DEPTH
+
+
+# ══════════════════════════════════════════════════════
+#  Phase 2: Dense retrieval (Q2 報告對照)
 # ══════════════════════════════════════════════════════
 PHASE_2_EMBED_MODEL = "BAAI/bge-m3"
+DENSE_TOP_K = TOP_K_SUBMIT
+DENSE_TOP_K_LARGE = CANDIDATE_POOL_DEPTH
 
 
 # ══════════════════════════════════════════════════════
-#  Phase 3b: 4-way RRF (BM25 + BGE-M3 dense/sparse/colbert) + image boost
-#  → Dev 0.8081  LB 0.72342  (P2 多向量證實有用)
+#  Phase 2b: Multimodal embedding (Q3 報告 a vs b 對照)
 # ══════════════════════════════════════════════════════
-PHASE_3B_USE_BM25 = True
-PHASE_3B_USE_DENSE = True
-PHASE_3B_USE_SPARSE = True     # +1.15 pp on strat dev
-PHASE_3B_USE_COLBERT = True    # strat dev 看似 -0.92 pp, 但 LB 證實 +1.16 pp (Phase 3d 驗證)
-PHASE_3B_WEIGHTS = [1.0, 1.0, 1.0, 1.0]
-PHASE_3B_IMAGE_BOOST = 0.004   # gold image:text=60:40, 此值最接近
+PHASE_2B_MM_MODEL = "google/siglip-so400m-patch14-384"
 
 
 # ══════════════════════════════════════════════════════
-#  Phase 4b: bge-reranker-v2-gemma + score fusion with Phase 3b RRF
-#  → Dev 0.8068  LB 0.72650 (current best)
-#  注意: 用 transformers 直接調用, FlagEmbedding 與 transformers 5.5 不相容
+#  Phase 6 (active LB-best pipeline): 純 LLM 直接 15→5
+#  → Dev 0.8988  LB 0.81895 (Qwen3.6-27B Q6_K GGUF, CL=1500)
 # ══════════════════════════════════════════════════════
-PHASE_4B_RERANKER_MODEL = "BAAI/bge-reranker-v2-gemma"
-PHASE_4B_RERANK_MAX_LEN = 512
-PHASE_4B_RERANK_BATCH = 16
-PHASE_4B_FUSION_ALPHA = 2.0    # final = z(rerank) + alpha * z(rrf_prior)
-PHASE_4B_IMAGE_BOOST_Z = 0.30  # 套在 z-scored fused score 上
 
-
-# ══════════════════════════════════════════════════════
-#  VLM image re-captioning (NVIDIA NIM)
-# ══════════════════════════════════════════════════════
+# NIM API (Gemma-4-31B 用; Q2 報告 direct LLM selection)
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
-# API key 可從環境變數覆寫; 預設留空, 請執行前 export
 NIM_API_KEY = os.environ.get(
     "NIM_API_KEY",
     "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",
 )
+DIRECT_LLM_NIM_MODEL = "google/gemma-4-31b-it"
+
+# 本地 GGUF (Phase 6 local 主要 pipeline)
+LOCAL_LLM_REPO = "unsloth/Qwen3.6-27B-GGUF"
+LOCAL_LLM_GGUF = "Qwen3.6-27B-Q6_K.gguf"
+
+
+# ══════════════════════════════════════════════════════
+#  VLM image re-captioning (Q3 報告: VLM 重生成 caption 對照)
+# ══════════════════════════════════════════════════════
 VLM_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 VLM_MAX_TOKENS = 1024
 VLM_TEMPERATURE = 0.2
-VLM_ENABLE_THINKING = False    # 關閉節省 ~8x output tokens (實驗證實)
+VLM_ENABLE_THINKING = False
 VLM_NUM_WORKERS = 6
 VLM_MIN_INTERVAL_SEC = 0.5
 VLM_SAVE_EVERY = 25
@@ -95,30 +94,6 @@ VLM_MAX_RETRIES = 4
 #  Submission
 # ══════════════════════════════════════════════════════
 SUBMISSION_COLUMNS = ["q_id", "gold_quotes"]
-
-
-# ══════════════════════════════════════════════════════
-#  Legacy / 報告用 (未在當前主 pipeline 使用)
-# ══════════════════════════════════════════════════════
-# Phase 1.5 - Direct LLM selection (Q2 報告四方法之一)
-PHASE_DIRECT_LLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-
-# Phase 2b - Multimodal embedding (Q3 報告 a vs b 對照)
-PHASE_2B_MM_MODEL = "google/siglip-so400m-patch14-384"
-
-# Phase 4 (original) - HyDE 已實驗證實退步 (Dev -13 pp), 保留但不建議使用
-PHASE_4_EXPANSION_MODEL = None  # 設 None 代表跳過 HyDE
-PHASE_4_RERANKER_MODEL = PHASE_4B_RERANKER_MODEL  # 後續腳本仍可能引用
-
-
-# ══════════════════════════════════════════════════════
-#  向後相容 — 舊腳本可能用到的別名
-# ══════════════════════════════════════════════════════
-BM25_TOP_K = TOP_K_SUBMIT
-BM25_TOP_K_LARGE = CANDIDATE_POOL_DEPTH
-DENSE_TOP_K = TOP_K_SUBMIT
-DENSE_TOP_K_LARGE = CANDIDATE_POOL_DEPTH
-RERANKER_TOP_K = TOP_K_SUBMIT
 
 
 # ══════════════════════════════════════════════════════
@@ -150,7 +125,6 @@ def print_config():
         val = getattr(module, name)
         if callable(val) or isinstance(val, types.ModuleType):
             continue
-        # API key 不印明文
         if "API_KEY" in name and isinstance(val, str) and len(val) > 12:
             val = val[:8] + "..." + val[-4:]
         print(f"  {name} = {val!r}")
