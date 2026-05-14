@@ -54,17 +54,15 @@ def encode_texts_mm(model, processor, texts: List[str], model_type: str, batch_s
     
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
-        inputs = processor(text=batch, return_tensors="pt", padding=True, truncation=True, max_length=256)
+        inputs = processor(text=batch, return_tensors="pt", padding=True, truncation=True, max_length=64)
         inputs = {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
         
         with torch.no_grad():
-            if model_type == "siglip":
-                text_embs = model.get_text_features(**inputs)
-            else:
-                text_embs = model.get_text_features(**inputs)
-        
+            out = model.get_text_features(**inputs)
+            text_embs = out.pooler_output if hasattr(out, "pooler_output") else out
+
         all_embs.append(text_embs.cpu().float().numpy())
-    
+
     return np.vstack(all_embs)
 
 
@@ -88,11 +86,9 @@ def encode_images_mm(model, processor, img_paths: List[str], model_type: str, ba
         inputs = {k: v.to(device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
         
         with torch.no_grad():
-            if model_type == "siglip":
-                img_embs = model.get_image_features(**inputs)
-            else:
-                img_embs = model.get_image_features(**inputs)
-        
+            out = model.get_image_features(**inputs)
+            img_embs = out.pooler_output if hasattr(out, "pooler_output") else out
+
         all_embs.append(img_embs.cpu().float().numpy())
     
     return np.vstack(all_embs)
@@ -124,10 +120,12 @@ def mm_retrieve_per_question(
     device = next(model.parameters()).device
     
     # 編碼 query
-    q_inputs = processor(text=[question], return_tensors="pt", padding=True, truncation=True, max_length=256)
+    q_inputs = processor(text=[question], return_tensors="pt", padding=True, truncation=True, max_length=64)
     q_inputs = {k: v.to(device) for k, v in q_inputs.items() if isinstance(v, torch.Tensor)}
     with torch.no_grad():
-        q_emb = model.get_text_features(**q_inputs).cpu().float().numpy()[0]
+        out = model.get_text_features(**q_inputs)
+        feat = out.pooler_output if hasattr(out, "pooler_output") else out
+        q_emb = feat.cpu().float().numpy()[0]
     
     scored = []
     
@@ -136,11 +134,13 @@ def mm_retrieve_per_question(
             # 用 text tower
             t_inputs = processor(
                 text=[c["text_for_retrieval"][:500]],
-                return_tensors="pt", padding=True, truncation=True, max_length=256,
+                return_tensors="pt", padding=True, truncation=True, max_length=64,
             )
             t_inputs = {k: v.to(device) for k, v in t_inputs.items() if isinstance(v, torch.Tensor)}
             with torch.no_grad():
-                c_emb = model.get_text_features(**t_inputs).cpu().float().numpy()[0]
+                out = model.get_text_features(**t_inputs)
+                feat = out.pooler_output if hasattr(out, "pooler_output") else out
+                c_emb = feat.cpu().float().numpy()[0]
         else:
             # 用 image tower
             img_path = get_img_path(c.get("img_path", ""))
@@ -152,7 +152,9 @@ def mm_retrieve_per_question(
             i_inputs = processor(images=[img], return_tensors="pt", padding=True)
             i_inputs = {k: v.to(device) for k, v in i_inputs.items() if isinstance(v, torch.Tensor)}
             with torch.no_grad():
-                c_emb = model.get_image_features(**i_inputs).cpu().float().numpy()[0]
+                out = model.get_image_features(**i_inputs)
+                feat = out.pooler_output if hasattr(out, "pooler_output") else out
+                c_emb = feat.cpu().float().numpy()[0]
         
         sim = float(cosine_sim(q_emb, c_emb.reshape(1, -1))[0])
         scored.append((c["quote_id"], sim))

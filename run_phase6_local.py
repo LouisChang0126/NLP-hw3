@@ -34,7 +34,7 @@ from run_phase6_direct_llm import (
 
 
 # ── 模型 ─────────────────────────────────────────────
-REPO_ID = "unsloth/Qwen3.6-27B-GGUF"
+REPO_ID = os.environ.get("REPO_ID", "unsloth/Qwen3.6-27B-GGUF")
 GGUF_FILE = os.environ.get("GGUF_FILE", "Qwen3.6-27B-Q6_K.gguf")
 # 若實際檔名不同 (e.g. sharded), 用 GGUF_FILE 環境變數覆蓋
 
@@ -46,12 +46,20 @@ N_BATCH = 512         # prefill 批次大小
 MAX_TOKENS = 64       # 輸出 5 個 IDs + spaces ~ 20-30 tok, 64 給點 margin
 TEMPERATURE = 0.0     # 確定性
 SAVE_EVERY = 25
-# 不同 CHAR_LIMIT 用不同 cache, 避免污染
+# 不同模型 / CHAR_LIMIT 用不同 cache, 避免污染
 _CL = int(os.environ.get("CHAR_LIMIT_PER_CANDIDATE", 800))
-CACHE_PATH = os.path.join(
-    config.OUTPUT_DIR, "phase_6_local",
-    f"llm_picks_cache_cl{_CL}.json" if _CL != 800 else "llm_picks_cache.json",
-)
+_MODEL_TAG = os.path.splitext(GGUF_FILE)[0].lower().replace(".", "_")
+_IS_DEFAULT_MODEL = GGUF_FILE == "Qwen3.6-27B-Q6_K.gguf"
+if _IS_DEFAULT_MODEL:
+    CACHE_PATH = os.path.join(
+        config.OUTPUT_DIR, "phase_6_local",
+        f"llm_picks_cache_cl{_CL}.json" if _CL != 800 else "llm_picks_cache.json",
+    )
+else:
+    CACHE_PATH = os.path.join(
+        config.OUTPUT_DIR, "phase_6_local",
+        f"llm_picks_cache_{_MODEL_TAG}_cl{_CL}.json",
+    )
 
 
 # ══════════════════════════════════════════════════════
@@ -216,7 +224,7 @@ def main():
     print("\n🔍 Stage 2: test prediction")
     test_preds = run_inference(test_data, llm, "test")
 
-    output_dir = config.get_output_dir("phase_6_local", "qwen36_27b_q6k")
+    output_dir = config.get_output_dir("phase_6_local", _MODEL_TAG)
     submission_path = os.path.join(output_dir, "submission.csv")
     generate_submission(test_preds, test_data, submission_path)
 
