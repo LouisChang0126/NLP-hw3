@@ -28,25 +28,27 @@ from submission_utils import generate_submission, save_metrics, append_leaderboa
 
 
 MODEL = "google/gemma-4-31b-it"
-NUM_WORKERS = 8
-MIN_INTERVAL_SEC = 0.3
-MAX_TOKENS = 64
-TEMPERATURE = 0.0
+NUM_WORKERS = 1
+MIN_INTERVAL_SEC = 2.0
+MAX_TOKENS = 2048
+TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.1))
+TOP_P = float(os.environ.get("TOP_P", 0.95))
 MAX_RETRIES = 4
-# 環境變數可覆寫 (CHAR_LIMIT_PER_CANDIDATE=1500 python run_phase6_*.py)
-CHAR_LIMIT_PER_CANDIDATE = int(os.environ.get("CHAR_LIMIT_PER_CANDIDATE", 800))
+CHAR_LIMIT_PER_CANDIDATE = int(os.environ.get("CHAR_LIMIT_PER_CANDIDATE", 0))
 SAVE_EVERY = 50
-CACHE_PATH = os.path.join(config.OUTPUT_DIR, "phase_6", "llm_picks_cache.json")
+# v4: permissive regex + 無 padding + max_tokens=2048
+_SUF = os.environ.get("CACHE_SUFFIX", "_v4")
+CACHE_PATH = os.path.join(config.OUTPUT_DIR, "phase_6", f"llm_picks_cache{_SUF}.json")
 
 
-PROMPT_TEMPLATE = """You are selecting evidence to support answering a question about a document. Below are candidate evidence items (text snippets and image descriptions). Pick exactly 5 that are most useful for answering the question.
+PROMPT_TEMPLATE = """You are an expert retrieval assistant. I will provide you with a question and a list of evidence items. Your task is to analyze the evidence and extract the top 5 most important evidence IDs that best answer the question.
 
-Question: {question}
+Question: {questions}
 
-Candidates:
+Evidence Items:
 {candidates}
 
-Output ONLY 5 IDs separated by spaces, in order of relevance (most relevant first). No explanation. Example: text3 image2 text5 text1 image4"""
+You MUST extract and rank EXACTLY 5 evidence IDs in descending order of importance. Even if you think fewer than 5 items are relevant, you MUST fill all 5 spots with your best guesses. DO NOT output fewer than 5 IDs. Output ONLY the 5 IDs separated by commas (e.g., text1, image3, text5, image2, text10)."""
 
 
 # ── persistence ──────────────────────────────────────
@@ -70,43 +72,37 @@ def save_cache(cache):
         os.replace(tmp, CACHE_PATH)
 
 
-# ── 解析 LLM 輸出 ────────────────────────────────────
-ID_PATTERN = re.compile(r"\b(text\d+|image\d+)\b", re.IGNORECASE)
+# ── 解析 LLM 輸出 (v4: permissive regex, no padding) ─────────────
+ID_PATTERN = re.compile(r"(text|image)[\s\-_]*(\d+)", re.IGNORECASE)
 
 
 def parse_ids(text: str, allowed_ids: set, top_k: int = 5) -> List[str]:
-    """從 LLM 輸出抽出合法 ID, 保序去重, 不夠 5 個就用候選池補"""
+    """從 LLM 輸出抽出合法 ID, 保序去重; 不足 top_k 就直接交"""
     if not text:
         return []
     found = ID_PATTERN.findall(text)
     seen = set()
     out = []
-    for fid in found:
-        fid = fid.lower()
+    for prefix, num in found:
+        fid = f"{prefix.lower()}{int(num)}"
         if fid in allowed_ids and fid not in seen:
             out.append(fid)
             seen.add(fid)
             if len(out) >= top_k:
                 break
-    # 補位 (用 allowed_ids 中尚未挑到的)
-    if len(out) < top_k:
-        for cid in allowed_ids:
-            if cid not in seen:
-                out.append(cid)
-                seen.add(cid)
-                if len(out) >= top_k:
-                    break
-    return out[:top_k]
+    return out
 
 
 # ── prompt 組裝 ──────────────────────────────────────
-def format_candidates(cands):
+def format_candidates(cands, char_limit: int = None):
+    """char_limit=None → 用模組層級 CHAR_LIMIT_PER_CANDIDATE; =0 表示不截斷"""
+    limit = CHAR_LIMIT_PER_CANDIDATE if char_limit is None else char_limit
     lines = []
     for c in cands:
         text = (c["text_for_retrieval"] or "").strip()
-        if len(text) > CHAR_LIMIT_PER_CANDIDATE:
-            text = text[:CHAR_LIMIT_PER_CANDIDATE] + "..."
-        lines.append(f"[{c['quote_id']}] {text}")
+        if limit > 0 and len(text) > limit:
+            text = text[:limit] + "..."
+        lines.append(f"[{c['quote_id']}]: {text}")
     return "\n".join(lines)
 
 
@@ -118,14 +114,15 @@ def worker(worker_id: int, samples: List[dict], cache: Dict[str, List[str]], pba
         if STOP.is_set():
             return
         q_id_str = str(sample["q_id"])
-        if q_id_str in cache and len(cache[q_id_str]) == 5:
+        # v4: accept whatever LLM gave (no len==5 check)
+        if q_id_str in cache:
             pbar.update(1)
             continue
 
         cands = build_candidates(sample)
         allowed = {c["quote_id"].lower() for c in cands}
         prompt = PROMPT_TEMPLATE.format(
-            question=sample["question"],
+            questions=sample["question"],
             candidates=format_candidates(cands),
         )
 
@@ -142,13 +139,14 @@ def worker(worker_id: int, samples: List[dict], cache: Dict[str, List[str]], pba
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=MAX_TOKENS,
                     temperature=TEMPERATURE,
+                    top_p=TOP_P,
+                    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
                 )
                 last_call = time.time()
                 raw = r.choices[0].message.content or ""
                 picks = parse_ids(raw, allowed, top_k=5)
-                if len(picks) == 5:
-                    break
-                tqdm.write(f"[w{worker_id}] q={q_id_str} parsed only {len(picks)}: {raw!r}; retry")
+                # v4: accept any result (no parse-retry)
+                break
             except Exception as e:
                 err = type(e).__name__
                 msg = str(e)[:120]
@@ -161,10 +159,8 @@ def worker(worker_id: int, samples: List[dict], cache: Dict[str, List[str]], pba
                 else:
                     tqdm.write(f"[w{worker_id}] ❌ q={q_id_str} give up: {err}: {msg}")
 
-        if not picks or len(picks) < 5:
-            # fallback: 用候選池前 5 個
-            picks = [c["quote_id"] for c in cands[:5]]
-        cache[q_id_str] = picks
+        # v4: 不再強制 fallback first-5 of build; 若 API 全失敗 picks=None → cache as []
+        cache[q_id_str] = picks if picks is not None else []
 
         if len(cache) % SAVE_EVERY == 0:
             save_cache(cache)
@@ -174,7 +170,8 @@ def worker(worker_id: int, samples: List[dict], cache: Dict[str, List[str]], pba
 # ── 流程 ─────────────────────────────────────────────
 def run_llm_pick(data: List[dict], desc: str) -> Dict[int, List[str]]:
     cache = load_cache()
-    todo = [s for s in data if str(s["q_id"]) not in cache or len(cache[str(s["q_id"])]) != 5]
+    # v4: 接受 <5 cache, 不重跑
+    todo = [s for s in data if str(s["q_id"]) not in cache]
     print(f"📥 cached: {len(cache)},  ⏳ todo: {len(todo)} ({desc})")
     if not todo:
         return {int(k): v for k, v in cache.items() if int(k) in {s["q_id"] for s in data}}
@@ -232,9 +229,10 @@ def main():
     print("\n🔍 Stage 2: test prediction")
     test_preds = run_llm_pick(test_data, "test")
 
-    output_dir = config.get_output_dir("phase_6", "gemma_4_31b_direct")
+    output_dir = config.get_output_dir("phase_6", "gemma_4_31b_direct_v4")
     submission_path = os.path.join(output_dir, "submission.csv")
-    generate_submission(test_preds, test_data, submission_path)
+    # v4: pad_short=False → 若 LLM 給 <5 直接交 <5
+    generate_submission(test_preds, test_data, submission_path, pad_short=False)
 
     metrics = {
         "phase": "phase_6",

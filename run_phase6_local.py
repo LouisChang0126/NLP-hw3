@@ -38,27 +38,31 @@ REPO_ID = os.environ.get("REPO_ID", "unsloth/Qwen3.6-27B-GGUF")
 GGUF_FILE = os.environ.get("GGUF_FILE", "Qwen3.6-27B-Q6_K.gguf")
 # 若實際檔名不同 (e.g. sharded), 用 GGUF_FILE 環境變數覆蓋
 
-# ── 推理參數 ─────────────────────────────────────────
+# ── 推理參數 (預設值 = LB-best, Dev 0.8988 / LB 0.81895) ─────────
 N_GPU_LAYERS = -1     # -1 = 全部 layers 上 GPU
-# 環境變數可覆寫: N_CTX=8192 CHAR_LIMIT_PER_CANDIDATE=1500 python run_phase6_local.py
-N_CTX = int(os.environ.get("N_CTX", 4096))
+# 環境變數可覆寫超參數, e.g. N_CTX=4096 CHAR_LIMIT_PER_CANDIDATE=800 python run_phase6_local.py
+N_CTX = int(os.environ.get("N_CTX", 8192))
 N_BATCH = 512         # prefill 批次大小
-MAX_TOKENS = 64       # 輸出 5 個 IDs + spaces ~ 20-30 tok, 64 給點 margin
-TEMPERATURE = 0.0     # 確定性
+MAX_TOKENS = 2048
+TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.0))
+TOP_P = float(os.environ.get("TOP_P", 1.0))
 SAVE_EVERY = 25
-# 不同模型 / CHAR_LIMIT 用不同 cache, 避免污染
-_CL = int(os.environ.get("CHAR_LIMIT_PER_CANDIDATE", 800))
+# 不同模型 / CHAR_LIMIT / temp 用不同 cache, 避免污染
+_CL = int(os.environ.get("CHAR_LIMIT_PER_CANDIDATE", 1500))
 _MODEL_TAG = os.path.splitext(GGUF_FILE)[0].lower().replace(".", "_")
 _IS_DEFAULT_MODEL = GGUF_FILE == "Qwen3.6-27B-Q6_K.gguf"
+_TEMP_SUF = "" if TEMPERATURE == 0.0 else f"_t{TEMPERATURE}".replace(".", "")
+_CACHE_SUFFIX = os.environ.get("CACHE_SUFFIX", "")
 if _IS_DEFAULT_MODEL:
     CACHE_PATH = os.path.join(
         config.OUTPUT_DIR, "phase_6_local",
-        f"llm_picks_cache_cl{_CL}.json" if _CL != 800 else "llm_picks_cache.json",
+        f"llm_picks_cache_cl{_CL}{_TEMP_SUF}{_CACHE_SUFFIX}.json" if _CL != 800
+        else f"llm_picks_cache{_TEMP_SUF}{_CACHE_SUFFIX}.json",
     )
 else:
     CACHE_PATH = os.path.join(
         config.OUTPUT_DIR, "phase_6_local",
-        f"llm_picks_cache_{_MODEL_TAG}_cl{_CL}.json",
+        f"llm_picks_cache_{_MODEL_TAG}_cl{_CL}{_TEMP_SUF}{_CACHE_SUFFIX}.json",
     )
 
 
@@ -134,8 +138,8 @@ def save_cache(cache):
 
 def run_inference(samples: List[dict], llm, desc: str) -> Dict[int, List[str]]:
     cache = load_cache()
-    todo = [s for s in samples
-            if str(s["q_id"]) not in cache or len(cache[str(s["q_id"])]) != 5]
+    # v4: 接受 <5 cache, 不重跑
+    todo = [s for s in samples if str(s["q_id"]) not in cache]
     print(f"📥 cached: {len(cache)},  ⏳ todo: {len(todo)} ({desc})")
     if not todo:
         return {int(k): v for k, v in cache.items()
@@ -149,8 +153,8 @@ def run_inference(samples: List[dict], llm, desc: str) -> Dict[int, List[str]]:
         cands = build_candidates(sample)
         allowed = {c["quote_id"].lower() for c in cands}
         prompt = PROMPT_TEMPLATE.format(
-            question=sample["question"],
-            candidates=format_candidates(cands),
+            questions=sample["question"],
+            candidates=format_candidates(cands, char_limit=_CL),
         )
         try:
             # 用 raw completion + 手動 chat template (bypass 預設 thinking)
@@ -159,17 +163,16 @@ def run_inference(samples: List[dict], llm, desc: str) -> Dict[int, List[str]]:
                 prompt=full_prompt,
                 max_tokens=MAX_TOKENS,
                 temperature=TEMPERATURE,
+                top_p=TOP_P,
                 stop=["<|im_end|>", "<|endoftext|>"],
             )
             raw = r["choices"][0]["text"] or ""
             picks = parse_ids(raw, allowed, top_k=5)
-            if len(picks) < 5:
-                # fallback: 用候選池前 5 個
-                picks = [c["quote_id"] for c in cands[:5]]
+            # v4: 接受 <5, 不 fallback
             cache[q_id_str] = picks
         except Exception as e:
             tqdm.write(f"❌ q={q_id_str}: {type(e).__name__}: {str(e)[:120]}")
-            cache[q_id_str] = [c["quote_id"] for c in cands[:5]]
+            cache[q_id_str] = []  # v4: 失敗交空
 
         pbar.update(1)
         # 每 SAVE_EVERY 題存一次
@@ -226,7 +229,8 @@ def main():
 
     output_dir = config.get_output_dir("phase_6_local", _MODEL_TAG)
     submission_path = os.path.join(output_dir, "submission.csv")
-    generate_submission(test_preds, test_data, submission_path)
+    # v4: pad_short=False → 若 LLM 給 <5 直接交 <5
+    generate_submission(test_preds, test_data, submission_path, pad_short=False)
 
     metrics = {
         "phase": "phase_6_local",

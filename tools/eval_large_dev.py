@@ -17,6 +17,10 @@ import sys
 import time
 from typing import Dict, List
 
+# ── 預設值 (必須在 import run_phase6_local 之前設定, 因模組層級讀取 env) ──
+os.environ.setdefault("CHAR_LIMIT_PER_CANDIDATE", "1500")
+os.environ.setdefault("N_CTX", "8192")
+
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,17 +31,15 @@ from evaluation import recall_at_k, error_analysis
 from run_phase6_direct_llm import PROMPT_TEMPLATE, parse_ids, format_candidates
 from run_phase6_local import build_qwen_prompt, download_gguf, load_llm
 
-# ── 設定 ────────────────────────────────────────────────────────
-os.environ.setdefault("CHAR_LIMIT_PER_CANDIDATE", "1500")
-os.environ.setdefault("N_CTX", "8192")
-
 CL = int(os.environ["CHAR_LIMIT_PER_CANDIDATE"])
+SUFFIX = os.environ.get("CACHE_SUFFIX", "")
 LARGE_DEV_FILE = os.path.join(config.SPLITS_DIR, "large_dev_ids.json")
 SMALL_DEV_CACHE = os.path.join(
-    config.OUTPUT_DIR, "phase_6_local", f"llm_picks_cache_cl{CL}.json"
+    config.OUTPUT_DIR, "phase_6_local", f"llm_picks_cache_cl{CL}{SUFFIX}.json"
 )
 LARGE_DEV_CACHE = os.path.join(
-    config.OUTPUT_DIR, "phase_6_local", f"llm_picks_cache_cl{CL}_largedev.json"
+    config.OUTPUT_DIR, "phase_6_local",
+    f"llm_picks_cache_cl{CL}{SUFFIX}_largedev.json"
 )
 
 MAX_TOKENS = 64

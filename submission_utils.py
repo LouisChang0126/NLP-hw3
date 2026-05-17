@@ -14,6 +14,7 @@ def generate_submission(
     test_data: List[dict],
     output_path: str,
     top_k: int = 5,
+    pad_short: bool = True,
 ) -> str:
     """
     產生 Kaggle 提交檔 (CSV)，精確對齊官方格式。
@@ -34,8 +35,8 @@ def generate_submission(
         q_id = sample["q_id"]
         pred_list = preds.get(q_id, [])[:top_k]
         
-        # 如果預測不足 top_k，用候選池中的 quote_id 補位
-        if len(pred_list) < top_k:
+        # 如果預測不足 top_k，用候選池中的 quote_id 補位 (除非 pad_short=False)
+        if pad_short and len(pred_list) < top_k:
             existing = set(pred_list)
             # 從 text_quotes 和 img_quotes 中補
             for tq in sample.get("text_quotes", []):
