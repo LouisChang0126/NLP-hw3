@@ -1,9 +1,3 @@
-// =====================================================================
-// NLP HW3 — Multimodal Retrieval-Augmented Generation
-// Author: <學號> (請於提交前替換)
-// Build:  typst compile document/HW3_report.typ document/HW3_<學號>.pdf
-// =====================================================================
-
 #set document(title: "INLP HW3 — Multimodal RAG Report")
 #set page(paper: "a4", margin: (x: 2.0cm, y: 2.2cm), numbering: "1")
 #set text(font: "Noto Serif CJK TC", size: 10.5pt, lang: "zh", region: "tw")
@@ -36,66 +30,51 @@
 
 == 整體 Pipeline
 
-最終提交的 pipeline 不使用 retriever，而是把每題*完整 15 個 candidates 直接交給 27B 開放權重 LLM*，由 LLM 一次性挑出 top-5 evidence。流程：
+最終提交的 pipeline 不使用 retriever，而是把每題*完整 15 個 candidates 直接交給 31B 開放權重 LLM*，由 LLM 一次性挑出 top-5 evidence。流程：
 
 #block(stroke: 0.5pt + luma(180), inset: 8pt, radius: 3pt)[
-  *問題 (q)* + *15 candidates* (text\_quotes + img\_quotes 的 `img_description`)
-  → 套用 prompt template (含 candidate 截斷 char\_limit=1500)
-  → Qwen3.6-27B Q6\_K GGUF 生成 5 個 `quote_id`
-  → 依輸出順序作為 ranked top-5 提交。
+  *question prompt* + *15 candidates* (text\_quotes + img\_description)
+  → 套用 prompt template
+  → Gemma-4-31B-it 生成 5 個 `quote_id`
+  → 解析輸出，依輸出順序作為 ranked top-5 提交。
 ]
 
 == 主要 idea
 
 任務有兩個關鍵特性，讓 retrieval 反而是「不必要的瓶頸」：
 
-1. *每題候選池極小 (≈ 15)*，遠小於一般 RAG 的數萬 chunks。把 15 個原文塞入 ≤ 8K 的 context 完全可行 (15 × 1500 char ≈ 6K tokens)。
+1. *每題候選池極小 (≈ 15)*，遠小於一般 RAG 的數萬 chunks。即便不截斷文本，整題 prompt 仍可在 LLM context window 範圍內。
 2. *evidence selection 依賴細節推理*（比較數字、找跨段落 references 等），這正是 LLM 比 dense embedding 拿手的場景。
 
-因此採用 *"retrieve-then-rank" 改為 "LLM-as-selector"*：跳過 retriever，由 LLM 直接做 relevance ranking。
+因此採用 *「retrieve-then-rank」改為「LLM-as-selector」*：跳過 retriever，由 LLM 直接做 relevance ranking。
 
 == Evidence preprocessing
 
-- *文本 candidates*：原樣傳入，僅截斷至 1500 字元（依 dev 細調，1500 比 800/1200/2000 都好，見 Q1 結尾的 ablation 表）。
-- *圖片 candidates*：採用 dataset 已附的 `img_description`（不重新跑 VLM）。`img_description` 已是高品質自然語言描述，混在 text candidates 中以同等形式呈現給 LLM，模型用 ID prefix (`text*` / `image*`) 自然區辨 modality。
-- *Prompt*：固定 system-like instruction，列出所有 candidates，要求輸出「space-separated 5 個 IDs，不解釋」。
+- *文本 candidates*：*原樣傳入不截斷* (CHAR\_LIMIT=0)，使 LLM 取得完整上下文。
+- *圖片 candidates*：採用 dataset 已附的 `img_description`（不重新跑 VLM）。`img_description` 已是高品質自然語言描述，混在 text candidates 中以同等形式呈現給 LLM，模型用 ID prefix (`text*` / `image*`) 自然區辨 modality。Evidence 統一以 `[quote_id]: content` 格式列出。
+- *Prompt*：強制要求模型輸出 EXACTLY 5 個 IDs：
+
   ```
-  Pick exactly 5 candidates most useful for answering the question.
-  Output ONLY 5 IDs separated by spaces, in order of relevance.
-  Example: text3 image2 text5 text1 image4
+  You are an expert retrieval assistant... extract the top 5 most
+  important evidence IDs that best answer the question.
+  ...
+  You MUST extract and rank EXACTLY 5 evidence IDs in descending order.
+  Even if you think fewer than 5 items are relevant, you MUST fill all 5
+  spots with your best guesses. DO NOT output fewer than 5 IDs.
+  Output ONLY the 5 IDs separated by commas (e.g., text1, image3, ...).
   ```
 
 == Ranking procedure
 
-LLM 輸出的 token 序列即為 ranked list；用 regex `(text|image)\d+` 抓取，過濾掉不在 allowed set 的 hallucinated IDs；若數量不足 5，補上 candidate pool 前若干個作 fallback。Temperature = 0 確保可重現。
+LLM 輸出的 token 序列即為 ranked list；用正規表示式 `(text|image)[\s\-_]*(\d+)`抓取，能容忍 `text 1` / `text_1` 等變體。過濾不在 allowed set 的 hallucinated IDs；*不做 padding* — 若 LLM 給少於 5 個 ID 即原樣交出（Kaggle 允許 fewer than top-k，亦比隨機補位更穩健）。
 
 == 額外技術
 
-+ *Reasoning bypass*：Qwen3.6-27B 預設 chat template 會於 assistant 段落起始處插入 `<think>\n` token，迫使模型先進行 reasoning。`max_tokens=64` 之預算不足以涵蓋完整 `<think>` 區塊，導致 reasoning token 佔用全部 output budget，最終輸出被截斷 (truncated) 且不含實際答案 (早期版本 LB=0.32049 即源於此)。解法為*手動組裝 chat template，預先填入空的 `<think>\n\n</think>\n\n`*，使模型直接略過 reasoning 階段。
++ *enable\_thinking=False*：透過 NIM 的 `chat_template_kwargs` 顯式關閉 Gemma 內建 reasoning，避免 `max_tokens` 預算被 `<think>` token 佔據。
 
-  ```python
-  prompt = (
-      "<|im_start|>user\n" + user + "<|im_end|>\n"
-      "<|im_start|>assistant\n"
-      "<think>\n\n</think>\n\n"   // ← 略過 reasoning
-  )
-  ```
++ *Sampling 設定 (NIM)*：temperature = 0.1 + top\_p = 0.95、max\_tokens = 2048，給足輸出空間並保留輕微 sampling 自由度。
 
-+ *Char-limit sweep*：依 dev 結果，CHAR\_LIMIT\_PER\_CANDIDATE = 1500 為最佳值。
-
-  #align(center)[
-    #table(
-      columns: 4, align: center, stroke: 0.5pt + luma(150),
-      [*CHAR\_LIMIT*], [*Dev Recall\@5*], [*Public LB*], [*Note*],
-      [800],  [0.8659], [0.81278], [初版],
-      [1500], [*0.8988*], [*0.81895*], [#text(rgb("#0a7a3b"))[*best*]],
-      [2000], [0.8977], [0.81818], [略遜於 1500],
-    )
-  ]
-
-+ *Local GGUF inference*：用 `llama-cpp-python` (CUDA build) 載入 Q6\_K 量化 (22 GB)，單卡 RTX 4090 全 layers 上 GPU，`n_ctx=8192, n_batch=512`。Test 1798 題約 27 分鐘完成（≈ 1.0 s/sample）。
-
-+ *Resumable cache*：以 `q_id` 為 key 存 JSON，每 25 題自動寫盤，crash 後可從中斷處 resume。dev 與 test 共用同份 cache 但以 split set 過濾避免 q\_id 撞號。
++ *單執行緒 + 2 s 間隔*：對 NIM 公開 endpoint 採低速率呼叫，避免並行造成的 429 限流大規模 fallback。
 
 = Q2. Comparison of Retrieval Methods (5%)
 
@@ -108,12 +87,12 @@ LLM 輸出的 token 序列即為 ranked list；用 regex `(text|image)\d+` 抓�
     [*Method*], [*Model*], [*Dev R\@5*], [*Public LB*], [*Note*],
     [*BM25*], [rank\_bm25 (Okapi)], [0.7364], [—], [baseline],
     [*Dense*], [BAAI/bge-m3 (dense)], [0.7389], [—], [single-vec],
-    [*direct LLM*], [Gemma-4-31B-it (NIM)], [0.8848], [0.80970], [純 LLM 15→5],
-    [*Ours*], [Qwen3.6-27B Q6\_K (local)], [*0.8988*], [*0.81895*], [#text(rgb("#0a7a3b"))[*best*]],
+    [*LLM (API)*], [Gemma-4-31B-it], [0.8854], [*0.82203*], [#text(rgb("#0a7a3b"))[*best*] — full optim],
+    [*LLM (local)*], [Qwen3.6-27B Q6\_K (local)], [*0.8988*], [0.81895], [開放權重本地, 無 API],
   )
 ]
 
-(另含 Hybrid RRF 等 retrieval-中心 pipeline 之 ablation：4-way BGE-M3 + BM25 RRF + img\_boost 達 Dev 0.8081 / LB 0.72342；加 bge-reranker-v2-gemma 為 0.8068 / 0.72650。皆遠低於 direct-LLM。)
+(另含 Hybrid RRF 等 retrieval-中心 pipeline 之 ablation：4-way BGE-M3 + BM25 RRF + img\_boost 達 Dev 0.8081 / LB 0.72342；加 bge-reranker-v2-gemma 為 0.8068 / 0.72650。皆遠低於 direct-LLM 路線。)
 
 == 強弱分析
 
@@ -121,9 +100,9 @@ LLM 輸出的 token 序列即為 ranked list；用 regex `(text|image)\d+` 抓�
 
 *Dense (BGE-M3)*：以 dual-encoder 將問題與候選嵌入至同一向量空間，依 cosine similarity 排序。優：捕捉語意相似性、對 paraphrase robust；缺：對細微差異（特定數字、實體名）區辨力弱；img\_description 中常見的 templated 描述使分數鑑別度降低，產生大量 false positives。
 
-*Direct LLM selection (Gemma-4-31B)*：將 15 候選與問題一同輸入 prompt，由 LLM 一次選 5。優：深層推理、跨 candidate 比較、modality 自然融合；缺：依賴 API/GPU、單題 latency 高（NIM 平均 \~ 3.5 s/題）。
+*Gemma-4-31B*：在 direct LLM 上層層套疊四組優化 — (i) *MUST-5 嚴格指令* + 不截斷候選文本，使 Gemma 能完整看到 evidence；(ii) 關閉 reasoning，避免 token budget 被 `<think>` 區塊佔用；(iii) temp=0.1 + top\_p=0.95，引入輕微 sampling 噪聲；(iv) permissive regex + 無 padding + max\_tokens=2048，能解析「text 1」「text\_1」等變體，且不為了湊滿 5 個 ID 亂猜。
 
-*Ours (Qwen3.6-27B Q6\_K local)*：在 direct-LLM 上施加四項優化 — (i) 開放權重本地推理（符合 ≤ 80B 規定，無 API quota）；(ii) reasoning bypass 解決因 reasoning token 佔用導致輸出被截斷 (truncated) 的問題；(iii) CHAR\_LIMIT 自 800 提升至 1500，每 candidate 訊息量提升約 2×；(iv) 確定性解碼搭配可恢復 cache。
+*Qwen3.6-27B Q6\_K*：開放權重本地 GGUF 推理，符合 ≤ 80B 規定且不依賴 API。對 CHAR\_LIMIT (1500 最佳) 與 temperature (0.0 最佳) 做專屬調校。LB 0.81895 略低於 Gemma-4-31B。
 
 == 為何 LLM-based 大幅領先 retrieval
 
@@ -136,8 +115,8 @@ LLM 輸出的 token 序列即為 ranked list；用 regex `(text|image)\d+` 抓�
 
 == 兩種方法
 
-+ *(a) Multimodal Embedding* — 用一個跨模態 encoder（這裡選 `google/siglip-so400m-patch14-384`，1B 參數，符合 ≤ 80B）的 *image tower* 編碼原始圖檔，與問題用 *text tower* 嵌入後 cosine ranking；text candidates 仍走 text tower。
-+ *(b) Text-Description Retrieval* — 把 `img_description` 當成純文字 evidence，所有 candidates 統一用 text-only encoder（BAAI/bge-m3，dense single-vec）做檢索；不接觸原始像素。
++ *(a) Multimodal Embedding:* 用一個跨模態 encoder（這裡選 `google/siglip-so400m-patch14-384`，1B 參數，符合 ≤ 80B）的 *image tower* 編碼原始圖檔，與問題用 *text tower* 嵌入後 cosine ranking；text candidates 仍走 text tower。
++ *(b) Text-Description Retrieval:* 把 `img_description` 當成純文字 evidence，所有 candidates 統一用 text-only encoder（BAAI/bge-m3，dense single-vec）做檢索；不接觸原始像素。
 
 == 實驗結果（Dev set, 200 題）
 
@@ -153,7 +132,7 @@ LLM 輸出的 token 序列即為 ranked list；用 regex `(text|image)\d+` 抓�
 
 #text(size: 9pt, fill: luma(80))[(Phase 2b 評估範圍 Dev 200 題；Image hit-rate = 0 並非隨機，是跨模態 cosine 分布錯位造成的系統性偏差，分析見下。)]
 
-== 我們選 (b)，原因
+== 選 (b)，因為
 
 + *對齊現有最佳 pipeline*：最終的 LLM-selection (Q1) 統一吃 text，img\_description 直接當 text evidence 餵入；用 (b) 與整套上下游 consistent。
 + *品質充足*：dataset 提供的 `img_description` 已是 caption-quality 的自然語言，能傳達圖表中的數值、軸標、趨勢，這些是 cosine-similarity 圖嵌入較弱的維度。
@@ -173,7 +152,9 @@ LLM 輸出的 token 序列即為 ranked list；用 regex `(text|image)\d+` 抓�
 
 = Q4. Modality Preference Analysis (10%)
 
-== Top-5 modality 分布（最佳 pipeline，Dev 200 題）
+(以下統計取自 Qwen3.6-27B local 路線之 Dev 200 與 large\_dev 899 預測。Gemma-4-31B 在 dev 上 modality 分布為 text 61.3%/img 38.7%，整體趨勢類似，下方結論皆適用兩條路線。)
+
+== Top-5 modality 分布（Qwen local LB-best，Dev 200 題）
 
 #align(center)[
   #table(
@@ -226,19 +207,24 @@ LLM-selector top-5 中 65% 為 text，但 ground-truth 僅 39% 為 text；image 
   #table(
     columns: 4, align: (left, left, center, center),
     stroke: 0.5pt + luma(180),
-    [*Phase*], [*Method (短描述)*], [*Dev R\@5*], [*Public LB*],
+    [*Phase / 版本*], [*Method*], [*Dev R\@5*], [*Public LB*],
     [Phase 1], [BM25], [0.7364], [—],
     [Phase 2], [BGE-M3 dense], [0.7389], [—],
+    [Phase 2b], [SigLIP-so400m multimodal embedding], [0.1660], [—],
     [Phase 3], [BM25+Dense RRF], [0.7713], [0.68875],
     [Phase 3b], [BGE-M3 4-way (dense+sparse+colbert)+BM25+img\_boost], [0.8081], [0.72342],
     [Phase 3c], [Phase3b + VLM caption concat], [0.8108], [0.72342],
     [Phase 4b], [Phase3b + bge-reranker-v2-gemma 融合], [0.8068], [0.72650],
     [Phase 4c], [Phase3c + reranker (overfit)], [0.8162], [0.72033],
     [Phase 5b], [Ensemble RRF 3b/3c/4b/4c], [0.8152], [0.72650],
-    [Phase 6 (NIM)], [Gemma-4-31B direct 15→5], [0.8848], [0.80970],
-    [*Phase 6 local*], [*Qwen3.6-27B Q6\_K, CL=1500 (best)*], [*0.8988*], [*0.81895*],
-    [Phase 6 long-ctx], [Gemma CL=2000], [0.8986], [0.79506],
-    [Phase 6 (35B-A3B)], [Qwen3.6-35B-A3B Q4\_K\_M MoE], [0.8255], [— (skip)],
+    [NIM v1 Gemma], [Gemma-4-31B direct 15→5, soft prompt, CL=800], [0.8848], [0.80970],
+    [NIM v2 Gemma], [+ MUST-5 + CL=0 + enable\_thinking=False], [0.8907], [0.82126],
+    [NIM v3 Gemma], [v2 + temp=0.1 + top\_p=0.95], [0.8967], [0.81972],
+    [*NIM v4 Gemma*], [*v3 + permissive regex + no padding + max\_tokens=2048*], [0.8854], [*0.82203*],
+    [Local v1 Qwen Q6\_K], [CL=1500, n\_ctx=8192, temp=0, soft prompt], [*0.8988*], [0.81895],
+    [Local v3 Qwen Q6\_K], [+ temp=0.1 + top\_p=0.95 (CL=0)], [0.8794], [0.81355],
+    [Local v4 Qwen Q6\_K], [CL=1500 + temp=0.1 + top\_p=0.95 + comma prompt], [0.8881], [0.81587],
+    [Local v6 Qwen Q6\_K], [Qwen 上 mirror NIM v4 全部設定], [0.8827], [0.81741],
     [Phase 6 hybrid], [Phase 3b top-10 → Qwen3.6-27B], [0.8759], [0.79583],
   )
 ]
@@ -249,25 +235,30 @@ LLM-selector top-5 中 65% 為 text，但 ground-truth 僅 39% 為 text；image 
 ```
 # 環境
 conda activate NLP2
-pip install llama-cpp-python  # 需 CUDA build
+pip install llama-cpp-python  # 本地路線需 CUDA build of llama-cpp-python
 
-# Reproduce 最佳結果 (Phase 6 local, LB 0.81895)
+# ── Reproduce LB-best (NIM v4 Gemma, LB 0.82203) ──
+python run_phase6_direct_llm.py
+# → outputs/phase_6/gemma_4_31b_direct_v4_<ts>/submission.csv
+
+# ── Reproduce 本地路線 (Local v1 Qwen, LB 0.81895) ──
 export CUDA_VISIBLE_DEVICES=0
-N_CTX=8192 CHAR_LIMIT_PER_CANDIDATE=1500 \
-  python run_phase6_local.py
-# → outputs/phase_6_local/<timestamp>/submission.csv
+N_CTX=8192 CHAR_LIMIT_PER_CANDIDATE=1500 TEMPERATURE=0.0 TOP_P=1.0 \
+    CACHE_SUFFIX=_v1 python run_phase6_local.py
+# → outputs/phase_6_local/<ts>/submission.csv
 
 # Q3 對照：Multimodal embedding (a)
 CUDA_VISIBLE_DEVICES=0 python run_phase2b_multimodal.py
-# → outputs/phase_2b/google_siglip-so400m-patch14-384_<ts>/
 
 # 評估
-python tools/compute_modality.py  # Q4 modality 分析
+python tools/compute_modality.py        # Q4 modality 分析
+python tools/eval_large_dev.py          # large_dev (n=899) 重新評估
 ```
 
-源碼結構（提交至 E3）：
-- `run_phase6_local.py`：最終最佳 pipeline (主程式)。
-- `run_phase6_direct_llm.py`：NIM Gemma 版本 (Q2 對照)。
+程式碼結構：
+- `run_phase6_direct_llm.py`：*LB-best Gemma 主程式*。
+- `run_phase6_local.py`：本地 Qwen 替代路線。
 - `run_phase1_bm25.py` / `run_phase2_dense.py` / `run_phase2b_multimodal.py`：Q2、Q3 baseline。
-- `dataset.py` / `evaluation.py` / `submission_utils.py`：共用工具。
+- `dataset.py` / `evaluation.py` / `submission_utils.py`：共用工具 (含 `pad_short=False` 控制不補位)。
 - `config.py`：所有超參數中央化設定。
+- `tools/eval_large_dev.py` / `compute_modality.py` / `build_large_dev.py`：診斷與 large\_dev 評估腳本。
