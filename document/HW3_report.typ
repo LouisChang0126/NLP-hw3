@@ -30,7 +30,7 @@
 
 == 整體 Pipeline
 
-最終提交的 pipeline 不使用 retriever，而是把每題*完整 15 個 candidates 直接交給開放權重 LLM*，由 LLM 一次性挑出 top-5 evidence。所用模型為 Gemma-4-31B-it (31B 參數，open-weight，符合作業 ≤ 80B 之規定；以 NVIDIA NIM 託管，但模型本身為開源)。
+最終提交的 pipeline 不使用 retriever，而是把每題*完整 15 個 candidates 直接交給開放權重 LLM*，由 LLM 一次性挑出 top-5 evidence。所用模型為 Gemma-4-31B-it (31B 參數；呼叫 NVIDIA NIM API，模型為開源模型)。
 
 #block(stroke: 0.5pt + luma(180), inset: 8pt, radius: 3pt)[
   *question* + *15 candidates* (`text_quotes` + `img_description`)
@@ -65,16 +65,16 @@ Question: {question}
 Evidence Items:
 {candidates}
 
-You MUST extract and rank EXACTLY 5 evidence IDs in descending order of
+You must extract and rank exactly 5 evidence IDs in descending order of
 importance. Even if you think fewer than 5 items are relevant, you MUST
 fill all 5 spots with your best guesses. DO NOT output fewer than 5 IDs.
-Output ONLY the 5 IDs separated by commas
-(e.g., text1, image3, text5, image2, text10).
+Output ONLY the 5 IDs separated by spaces
+(e.g., text1 image3 text5 image2 text10).
 ```
 
 == Ranking procedure
 
-LLM 輸出的 token 序列即為 ranked list；用正規表示式 `(text|image)[\s\-_]*(\d+)` 抓取，能容忍 `text 1` / `text_1` 等格式變體。過濾不在 allowed set 的 hallucinated IDs；不為了湊滿 5 個 ID 而填充，少於 5 個即原樣交出 (Kaggle 允許 fewer than top-k，亦比隨機補位更穩健)。
+LLM 輸出的 token 序列即為 ranked list；用正規表示式 `(text|image)[\s\-_]*(\d+)` 抓取，能容忍 `text 1` / `text_1` 等格式變體。過濾不在 allowed set 的 hallucinated IDs；少於 5 個即重新調用API。
 
 == 額外技術
 
@@ -82,9 +82,12 @@ LLM 輸出的 token 序列即為 ranked list；用正規表示式 `(text|image)[
 
 + *enable\_thinking=False*：透過 NIM 的 `chat_template_kwargs` 顯式關閉 Gemma 內建 reasoning，避免 `max_tokens=2048` 之輸出預算被 `<think>` token 佔據。
 
-+ *Min-quotes retry loop*：若單次回應解析出之有效 ID 數 < 4 (`min_quotes=4`)，自動重試最多 12 次並指數型 backoff，最終取所有 attempts 中解析到最多 ID 之回應。此設計能補救偶發 API timeout / 空回應 / 格式錯誤造成的 evidence 漏失。
++ *Min-quotes retry loop*：若單次回應解析出之有效 ID 數 < 5 (`min_quotes=5`)，自動重試最多 12 次並指數型 backoff，最終取所有 attempts 中解析到最多 ID 之回應。此設計能補救偶發 API timeout / 空回應 / 格式錯誤造成的 evidence 漏失。
 
-+ *單執行緒 + 2 s 間隔*：對 NIM 公開 endpoint 採低速率呼叫，避免並行造成的 429 限流大規模 fallback。
++ *Evidence modality 過濾*：觀察 train 後得到硬規則 — `evidence_modality_type` 只含 `text` 之題目，gold 100 % 落在 `text*`；只含 `table / figure / chart` 之題目，gold 100 % 落在 `image*`。據此於送入 LLM 前 *prune 掉另一型態之 candidates*：
+  - `evidence_modality_type` 含 text 不含 image-like → 移除全部 image candidates
+  - `evidence_modality_type` 含 image-like 不含 text → 移除全部 text candidates
+  - 兼有兩者或為空 → 不過濾（fallback）
 
 = Q2. Comparison of Retrieval Methods (5%)
 
@@ -98,7 +101,7 @@ LLM 輸出的 token 序列即為 ranked list；用正規表示式 `(text|image)[
     [*BM25*], [rank\_bm25 (Okapi)], [0.7364], [—], [baseline],
     [*Dense*], [BAAI/bge-m3 (dense)], [0.7389], [—], [single-vec dual encoder],
     [*Direct LLM*], [Gemma-4-31B-it (baseline)], [0.8848], [0.80970], [Simple prompt, default sampling],
-    [*Own method*], [Gemma-4-31B-it (refined)], [0.8858], [#text(rgb("#0a7a3b"))[*0.87211*]], [#text(rgb("#0a7a3b"))[*best*] — deterministic + retry],
+    [*Own method*], [Gemma-4-31B-it (refined)], [0.9057], [#text(rgb("#0a7a3b"))[*0.88597*]], [#text(rgb("#0a7a3b"))[*best*] — deterministic + retry + modality filter],
   )
 ]
 
@@ -110,7 +113,7 @@ LLM 輸出的 token 序列即為 ranked list；用正規表示式 `(text|image)[
 
 *Direct LLM (baseline)*：直接把 15 個 candidates 餵給 Gemma-4-31B-it 並用簡單 prompt 要求挑出 top-5。優：跳過 retriever 之 false negative，將 ranking 交由具推理能力之 LLM；缺：在 default sampling (temp=0.7, top\_p≈1.0) 下，相同設定多次跑分結果 LB 飄移可達 ±0.5 pp；偶發回應只給 < 5 IDs 之 case 無補救機制。
 
-*Own method (refined)*：在 Direct LLM 之上層層套疊以下優化 — (i) *deterministic decoding* (temp=0, top\_p=0.1) 鎖死採樣使結果可重現；(ii) *關閉 reasoning* 避免 token budget 浪費；(iii) *min-quotes retry loop* (max 12 attempts) 補救少數 < 4 IDs 之 case；(iv) *permissive regex + 無 padding* 容忍輸出格式變體且不亂猜補位。Dev R\@5 與 baseline 幾乎相同 (0.8854 → 0.8858)，但 *LB 提升 6.24 pp*，說明 LB 收益主要來自 *在 1798 個 test sample 上累積之穩定性*；200 題 dev 量不足以反映這種累積差異。
+*Own method (refined)*：在 Direct LLM 之上層層套疊以下優化 — (i) *deterministic decoding* (temp=0, top\_p=0.1) 鎖死採樣使結果可重現；(ii) *關閉 reasoning* 避免 token budget 浪費；(iii) *min-quotes retry loop* (max 12 attempts) 補救少數 < 4 IDs 之 case；(iv) *permissive regex + 無 padding* 容忍輸出格式變體且不亂猜補位；(v) *evidence modality 過濾* (依 `evidence_modality_type` prune 對立 modality candidates) — 單此一項即 +1.39 pp LB (0.87211 → 0.88597)。Dev R\@5 略升 (0.8858 → 0.9057)，*LB 共提升 7.63 pp*。
 
 == 為何 LLM-based 大幅領先 retrieval
 
@@ -161,27 +164,45 @@ LLM 輸出的 token 序列即為 ranked list；用正規表示式 `(text|image)[
 
 = Q4. Modality Preference Analysis (10%)
 
-(以下統計取自 *Own method (Gemma-4-31B-it refined)* 之 Dev 200 題預測。)
+== 觀察一：未加 modality filter 之原始 LLM 行為偏向 text
 
-== Top-5 modality 分布（Dev 200 題）
+未啟用 Q1 之 *evidence modality 過濾* 時（即直接把 15 個 candidates 不過濾餵入 LLM），dev 200 題之 top-5 modality 分布如下：
 
 #align(center)[
   #table(
     columns: 4, align: center, stroke: 0.5pt + luma(150),
     [*Source*], [*Text count (%)*], [*Image count (%)*], [*Total*],
-    [Predicted Top-5], [602 (*60.7%*)], [389 (*39.3%*)], [991],
-    [Gold answers],   [199 (39.3%)],   [307 (60.7%)],   [506],
+    [Predicted Top-5 (no filter)], [602 (*60.7%*)], [389 (*39.3%*)], [991],
+    [Gold answers], [199 (39.3%)], [307 (60.7%)], [506],
     [Bias (pred − gold)], [#text(fill: rgb("#b03030"))[*+21.4 pp*]], [#text(fill: rgb("#b03030"))[*−21.4 pp*]], [—],
   )
 ]
 
-#text(size: 9pt, fill: luma(80))[(Predicted total = 991 而非 1000，係因 9 題 LLM 輸出有效 ID < 5，依設計不強制補位。)]
+LLM 在無 prior 之 retrieval 中 *系統性偏好 text*：top-5 有 60.7% 為 text，但 gold 只有 39.3%；image evidence 因此 under-retrieved 約 21.4 pp。
 
-== 結論：模型 *過度偏好 text*
+== 偏好成因
 
-LLM-selector top-5 中 60.7% 為 text，但 ground-truth 僅 39.3% 為 text；image evidence 受到 *系統性 under-retrieval*，差距約 21.4 個百分點。
++ *Token 佔比不對稱*：`text_quotes` 中位數 \~ 1100 字元；`img_description` 中位數 \~ 250 字元。LLM 在 prompt 中接收到的 text token 量約為 image 的 4×，attention 分布因而偏向 text candidates。
 
-== Per-modality hit-rate （更細的視角）
++ *Img\_description 風格較 templated*：image 描述多以「This figure shows…」「The chart illustrates…」起頭，LLM 將之視為敘述性 (descriptive) 而非事實性 (factual)；在 picking task 中傾向選擇含具體數字或引文之 text snippet。
+
+== 觀察二：加上 modality filter 後分布修正至近乎中性
+
+啟用 Q1 之 modality filter 後，dev 200 題之分布變為：
+
+#align(center)[
+  #table(
+    columns: 4, align: center, stroke: 0.5pt + luma(150),
+    [*Source*], [*Text count (%)*], [*Image count (%)*], [*Total*],
+    [Predicted Top-5 (w/ filter)], [372 (*37.2%*)], [627 (*62.8%*)], [999],
+    [Gold answers], [199 (39.3%)], [307 (60.7%)], [506],
+    [Bias (pred − gold)], [#text(fill: rgb("#0a7a3b"))[*−2.1 pp*]], [#text(fill: rgb("#0a7a3b"))[*+2.1 pp*]], [—],
+  )
+]
+
+Bias 從 ±21.4 pp 收斂至 ±2.1 pp，幾乎完全對齊 gold 分布。
+
+== Per-modality hit-rate （filter on）
 
 #align(center)[
   #table(
@@ -189,39 +210,26 @@ LLM-selector top-5 中 60.7% 為 text，但 ground-truth 僅 39.3% 為 text；im
     stroke: 0.5pt + luma(150),
     [*Modality*], [*Gold count*], [*Hits in top-5*], [*Hit-rate*],
     [text],  [199], [154], [0.7739],
-    [image], [307], [262], [*0.8534*],
+    [image], [307], [269], [*0.8762*],
   )
 ]
 
-值得注意的現象：*當 LLM 選擇 image candidates 時，per-modality precision 反而較高 (0.85 > 0.77)*；惟其選取 image 之數量偏低（僅佔 top-5 的 39%），整體 image evidence 仍有 \~ 15% (45/307) 之 false-negative 漏失。
+Image per-modality hit-rate (0.8762) 高於 text (0.7739)，反映 *當 LLM 真的選 image 時挑得相當準*；filter 之主要作用即在於 *允許 LLM 把原本被 text 擠掉的 image candidates 提到 top-5 之內*。
 
-== 形成原因分析
+== 為何 modality filter 同時提升 LB
 
-+ *Image candidates 訊號量受 prompt token 佔比削弱*：`img_description` 通常較短（中位數 \~ 250 字元）；`text_quotes` 中位數 \~ 1100 字元，於 prompt 中之 token 佔比約 4×。LLM 接收之 text token 顯著多於 image token，attention 分布因而偏向 text candidates。
+純單一型態 (text-only 或 image-only) 之題目佔 train 比例頗高 (image-only 樣本占 40.8%)。對這些題目，將對立 modality 之 distractor 整批移除，縮小 candidate pool (15 → 5 或 10)，降低 LLM 比較負擔
 
-+ *Img\_description 風格趨於 templated*：許多 image 描述以「This figure shows…」「The chart illustrates…」開頭，LLM 將其視為敘述性 (descriptive) 而非事實性 (factual) 內容；在 picking task 中傾向選擇含具體數字或引文之 text snippet，而非 chart description。
-
-+ *Question 含 textual anchor 觸發 shortcut*：HW3 問題常出現「In the section about X…」「According to Table 3…」等 textual anchor；LLM 過度依賴文字錨點 (textual anchors) 進行表面特徵匹配，造成 text-favored shortcut。
-
-+ *Image per-modality precision 較高之解讀*：當 image candidate 與問題語意明確對齊（例如問「該圖顯示什麼」），其被選中之機率極高；hit-rate 較高之原因在於 LLM 對 image 候選採取較保守的選擇策略 (high-precision, low-recall behavior)。Text 因候選數量多、訊號雜訊比較低，false-positive 數量相對較高。
-
-== 改進方向（未實作）
-
-- *Length-normalized prompt*：將 text candidates 壓縮至與 `img_description` 相近之長度（例如統一 char\_limit=400），有助於使 modality 分布趨於中性。
-- *Explicit modality budget*：於 prompt 中加入「expected mix \~ 40 % text / 60 % image」之顯式指示，使 LLM 進行 modality balancing。
-- *Two-pass selection*：第一階段於 text candidates 中選出 top-2，第二階段於 image candidates 中補足 3 項。
+實驗驗證：Public LB 由 0.87211 → 0.88597 (+1.39 pp)，與 dev 上之 bias 修正方向一致。
 
 = 附錄 A：執行與重現
 
 ```
-# 環境
-conda activate NLP2
-
-# ── Reproduce LB-best (Own method, LB 0.87211) ──
+# ── Reproduce LB-best (Own method, LB 0.88597) ──
 # 先把 NIM API key 放到 api_key.txt
-python SOTA.py --input test.jsonl --output submission.csv \
+python HW3_111550132.py --input test.jsonl --output submission.csv \
                --backup gemma_answering_results.json \
-               --min-quotes 4 --max-attempts 12 --gap 2.0
+               --min-quotes 4 --max-attempts 12
 
 # ── 對照 baselines (Q2 / Q3) ──
 python run_phase1_bm25.py            # BM25
@@ -229,14 +237,14 @@ python run_phase2_dense.py           # BGE-M3 dense
 python run_phase2b_multimodal.py     # SigLIP (Q3)
 
 # ── 評估與診斷 ──
-python tools/compute_modality.py     # Q4 modality 分析
+python compute_modality.py     # Q4 modality 分析
 python evaluation.py                 # Dev Recall@5
 ```
 
 == 程式碼結構
 
-- `SOTA.py`：*LB-best 主程式* — Gemma-4-31B-it direct 15→5 with deterministic decoding + min-quotes retry。
+- `HW3_111550132.py`：Gemma-4-31B-it direct 15→5 with deterministic decoding + min-quotes retry。
 - `run_phase1_bm25.py` / `run_phase2_dense.py` / `run_phase2b_multimodal.py`：Q2、Q3 baseline。
 - `dataset.py` / `evaluation.py` / `submission_utils.py`：共用工具。
 - `config.py`：超參數中央化設定。
-- `tools/compute_modality.py`：Q4 modality 分析腳本。
+- `compute_modality.py`：Q4 modality 分析腳本。
