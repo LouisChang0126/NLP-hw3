@@ -1,86 +1,87 @@
 """
-INLP HW3 - Phase 6: 純 LLM 直接從 15 個候選挑 5 個
+RAG submission pipeline.
 
-Model: google/gemma-4-31b-it (via NVIDIA NIM)
-- Deterministic decoding (temperature=0, top_p=0.1)
-- Modality pruning: evidence_modality_type 限制候選池
-- Min-quotes retry loop (預設門檻 5, 最多 12 attempts)
-- 多執行緒 (預設 4) + 60s sliding-window rate limit (預設 37 calls)
-- 可中斷可續跑（cache resumable, atomic write）
+End-to-end:
+  1. 讀 test.jsonl
+  2. 對每一筆 q_id 打 Gemma API 取得 top-5 證據排序
+  3. 自動重試直到該筆 gold_quotes 至少有 MIN_QUOTES 個 ID
+  4. 寫出 submission.csv 與 gemma_answering_results.json
+  5. 每一筆都即時存檔，可斷點續跑（再次執行只會重打不足門檻的列）
+
+用法：
+  python HW3_111550132.py
+  python HW3_111550132.py --input test.jsonl --output submission.csv \
+      --backup gemma_answering_results.json --min-quotes 4 --max-attempts 12 \
+      --rate 37 --workers 8
+
+設計重點：
+  - Windows cp950 控制台相容：強制 stdout 使用 utf-8，純文字訊息（無 emoji）
+  - 不會因為 API timeout / 空回應 / 解析失敗而崩潰；該筆會持續重試
+  - 多執行緒 + 60 秒滑動視窗 rate limit（預設 37 calls/min，符合 NIM 40 上限）
+  - Resume：偵測既有 backup JSON 與 submission.csv，已達門檻者直接沿用
 """
+
+from __future__ import annotations
+
+import argparse
 import collections
+import concurrent.futures
+import datetime as _dt
 import json
 import os
 import re
-import random
-import signal
+import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
+from typing import Dict, List, Optional, Set
 
-from tqdm import tqdm
-from openai import OpenAI
-
-import config
-from dataset import (
-    load_train, load_test, build_candidates,
-    split_train_dev, get_gold_quotes_dict,
-)
-from evaluation import recall_at_k, error_analysis
-from submission_utils import generate_submission, save_metrics, append_leaderboard
+import pandas as pd
+import requests
+from tqdm.auto import tqdm
 
 
-MODEL = "google/gemma-4-31b-it"
-NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 4))
-# Sliding-window rate limit: max calls per 60-second window (NIM 上限 40, 預設 37 留 buffer)
-RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", 37))
-MAX_TOKENS = int(os.environ.get("MAX_TOKENS", 2048))
-TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.0))
-TOP_P = float(os.environ.get("TOP_P", 0.1))
-ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "0") == "1"
-MAX_RETRIES = int(os.environ.get("MAX_RETRIES", 12))
-MIN_QUOTES_THRESHOLD = int(os.environ.get("MIN_QUOTES_THRESHOLD", 5))  # SOTA.py default 5; retry if parsed picks < this
-CHAR_LIMIT_PER_CANDIDATE = int(os.environ.get("CHAR_LIMIT_PER_CANDIDATE", 0))
-SAVE_EVERY = 50
-_SUF = os.environ.get("CACHE_SUFFIX", "")
-CACHE_PATH = os.path.join(config.OUTPUT_DIR, "phase_6", f"llm_picks_cache{_SUF}.json")
-# 觀察用：與 SOTA.py 相容的 per-question 完整回應紀錄
-RESULTS_PATH = os.path.join(config.OUTPUT_DIR, "phase_6", f"gemma_answering_results{_SUF}.json")
+# ---------------------------------------------------------------------------
+# Console / encoding helpers
+# ---------------------------------------------------------------------------
 
-# ── Evidence modality pruning rule (from SOTA.py) ────────────────────
-# train.jsonl 觀察硬規則：
-#   evidence_modality_type 只含 text          → gold 100% 只有 text*
-#   evidence_modality_type 只含 image-like    → gold 100% 只有 image*
-# 因此在純單一型態的題目，把另一型態的候選 prune 掉可大幅降低 distractor。
-_TEXT_MODALITIES = {"text"}
-_IMAGE_MODALITIES = {"table", "figure", "chart", "image"}
+def _configure_stdout() -> None:
+    """讓中文訊息在 Windows cp950 主控台也能正常輸出。"""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
-def filter_candidates_by_modality(sample: dict, cands: List[dict]) -> List[dict]:
-    """依 evidence_modality_type 剔除不可能成為答案的型態。空 / 兼有兩者 → 不過濾。"""
-    mods = set(sample.get("evidence_modality_type") or [])
-    has_text = bool(mods & _TEXT_MODALITIES)
-    has_image = bool(mods & _IMAGE_MODALITIES)
-    keep_text = has_text or not (has_text or has_image)
-    keep_image = has_image or not (has_text or has_image)
-
-    out = []
-    for c in cands:
-        m = c.get("modality")
-        if m == "text" and keep_text:
-            out.append(c)
-        elif m == "image" and keep_image:
-            out.append(c)
-    return out or cands  # 守備：filter 後空就回退
+_LOG_LOCK = threading.Lock()
 
 
-# ── RateLimiter — sliding-window cross-thread (from SOTA.py) ─────────
+def log(msg: str) -> None:
+    """執行緒安全輸出。透過 tqdm.write 避免破壞進度條畫面。"""
+    with _LOG_LOCK:
+        try:
+            tqdm.write(msg)
+        except UnicodeEncodeError:
+            sys.stdout.buffer.write((msg + "\n").encode("utf-8", errors="replace"))
+            sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter — sliding window across all worker threads
+# ---------------------------------------------------------------------------
+
 class RateLimiter:
+    """限制 60 秒滑動視窗內 API 呼叫次數，多執行緒安全。"""
+
     def __init__(self, max_calls: int, window_seconds: float = 60.0) -> None:
+        if max_calls <= 0:
+            raise ValueError("max_calls 必須 > 0")
         self.max_calls = max_calls
         self.window = window_seconds
-        self._ts: "collections.deque[float]" = collections.deque()
+        self._timestamps: "collections.deque[float]" = collections.deque()
         self._lock = threading.Lock()
 
     def acquire(self) -> None:
@@ -88,294 +89,466 @@ class RateLimiter:
             with self._lock:
                 now = time.monotonic()
                 cutoff = now - self.window
-                while self._ts and self._ts[0] <= cutoff:
-                    self._ts.popleft()
-                if len(self._ts) < self.max_calls:
-                    self._ts.append(now)
+                while self._timestamps and self._timestamps[0] <= cutoff:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self.max_calls:
+                    self._timestamps.append(now)
                     return
-                wait_until = self._ts[0] + self.window
-            time.sleep(max(0.05, wait_until - time.monotonic()))
+                wait_until = self._timestamps[0] + self.window
+            sleep_for = max(0.05, wait_until - time.monotonic())
+            time.sleep(sleep_for)
 
 
-RATE_LIMITER = RateLimiter(max_calls=RATE_LIMIT_PER_MIN, window_seconds=60.0)
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+
+INVOKE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+MODEL_NAME = "google/gemma-4-31b-it"
 
 
-PROMPT_TEMPLATE = """You are an expert retrieval assistant. I will provide you with a question and a list of evidence items. Your task is to analyze the evidence and extract the top 5 most important evidence IDs that best answer the question.
-
-Question: {questions}
-
-Evidence Items:
-{candidates}
-
-You MUST extract and rank EXACTLY 5 evidence IDs in descending order of importance. Even if you think fewer than 5 items are relevant, you MUST fill all 5 spots with your best guesses. DO NOT output fewer than 5 IDs. Output ONLY the 5 IDs separated by commas (e.g., text1, image3, text5, image2, text10)."""
+def slugify_model_name(name: str) -> str:
+    """把 model id (例如 'google/gemma-4-31b-it') 轉成可當資料夾名稱的 slug。"""
+    tail = name.rsplit("/", 1)[-1]
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", tail).strip("_")
+    return slug or "model"
 
 
-# ── persistence ──────────────────────────────────────
-SAVE_LOCK = threading.Lock()
-STOP = threading.Event()
+def default_output_dir(model_name: str = MODEL_NAME) -> str:
+    """outputs/phase_6/{model_slug}_{mmddhhmm}"""
+    stamp = _dt.datetime.now().strftime("%m%d%H%M")
+    return os.path.join("outputs", "phase_6", f"{slugify_model_name(model_name)}_{stamp}")
 
 
-def load_cache():
-    if not os.path.exists(CACHE_PATH):
-        return {}
-    with open(CACHE_PATH, "r") as f:
-        return json.load(f)
+def load_api_key(filepath: str) -> str:
+    if not os.path.exists(filepath):
+        log(f"[FATAL] 找不到 API Key 檔案 '{filepath}'")
+        sys.exit(1)
+    with open(filepath, "r", encoding="utf-8") as f:
+        key = f.read().strip()
+    if not key:
+        log(f"[FATAL] API Key 檔案 '{filepath}' 是空的")
+        sys.exit(1)
+    return key
 
 
-def save_cache(cache):
-    os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
-    with SAVE_LOCK:
-        tmp = CACHE_PATH + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(cache, f)
-        os.replace(tmp, CACHE_PATH)
-
-
-def load_results() -> Dict[str, dict]:
-    """以 q_id_str 索引的完整回應紀錄；檔案落地時是 SOTA.py 的 list 格式。"""
-    if not os.path.exists(RESULTS_PATH):
-        return {}
-    with open(RESULTS_PATH, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, list):
-        return {str(r["q_id"]): r for r in data if "q_id" in r}
-    # 容錯：若曾被改成 dict 格式也讀得進來
-    return {str(k): v for k, v in data.items()}
-
-
-def save_results(results: Dict[str, dict]):
-    os.makedirs(os.path.dirname(RESULTS_PATH), exist_ok=True)
-    with SAVE_LOCK:
-        tmp = RESULTS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(list(results.values()), f, ensure_ascii=False, indent=2)
-        os.replace(tmp, RESULTS_PATH)
-
-
-# ── 解析 LLM 輸出 ────────────────────────────────────────────────
-ID_PATTERN = re.compile(r"(text|image)[\s\-_]*(\d+)", re.IGNORECASE)
-
-
-def parse_ids(text: str, allowed_ids: set, top_k: int = 5) -> List[str]:
-    """從 LLM 輸出抽出合法 ID, 保序去重; 不足 top_k 就直接交"""
-    if not text:
-        return []
-    found = ID_PATTERN.findall(text)
-    seen = set()
-    out = []
-    for prefix, num in found:
-        fid = f"{prefix.lower()}{int(num)}"
-        if fid in allowed_ids and fid not in seen:
-            out.append(fid)
-            seen.add(fid)
-            if len(out) >= top_k:
-                break
-    return out
-
-
-# ── prompt 組裝 ──────────────────────────────────────
-def format_candidates(cands, char_limit: int = None):
-    """char_limit=None → 用模組層級 CHAR_LIMIT_PER_CANDIDATE; =0 表示不截斷"""
-    limit = CHAR_LIMIT_PER_CANDIDATE if char_limit is None else char_limit
-    lines = []
-    for c in cands:
-        # 不 strip：SOTA reference 直接灌 raw text；拿掉 strip 才能 byte-for-byte 對齊
-        text = c["text_for_retrieval"] or ""
-        if limit > 0 and len(text) > limit:
-            text = text[:limit] + "..."
-        lines.append(f"[{c['quote_id']}]: {text}")
-    return "\n".join(lines)
-
-
-# ── worker ───────────────────────────────────────────
-def worker(
-    worker_id: int,
-    samples: List[dict],
-    cache: Dict[str, List[str]],
-    results: Dict[str, dict],
-    pbar,
-):
-    client = OpenAI(base_url=config.NIM_BASE_URL, api_key=config.NIM_API_KEY)
-    for sample in samples:
-        if STOP.is_set():
-            return
-        q_id_str = str(sample["q_id"])
-        # Only skip if we already have a full 5-pick result cached
-        if q_id_str in cache and len(cache[q_id_str]) >= 5:
-            pbar.update(1)
-            continue
-
-        cands = filter_candidates_by_modality(sample, build_candidates(sample))
-        allowed_list = [c["quote_id"].lower() for c in cands]  # ordered fallback pool
-        allowed = set(allowed_list)
-        prompt = PROMPT_TEMPLATE.format(
-            questions=sample["question"],
-            candidates=format_candidates(cands),
-        )
-
-        # Retry until len(picks) >= MIN_QUOTES_THRESHOLD or attempts run out.
-        # Threshold is always MIN_QUOTES_THRESHOLD (5) unless `allowed` itself
-        # has fewer items — in which case we accept what we can get and pad
-        # with the rest before caching.
-        best_picks: List[str] = list(cache.get(q_id_str, []))
-        last_raw: str = ""  # 最近一次 (或最佳一次) 的原始回應，方便事後檢視
-        threshold = min(MIN_QUOTES_THRESHOLD, max(1, len(allowed)))
-        for attempt in range(MAX_RETRIES):
-            RATE_LIMITER.acquire()
-            try:
-                r = client.chat.completions.create(
-                    model=MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=MAX_TOKENS,
-                    temperature=TEMPERATURE,
-                    top_p=TOP_P,
-                    extra_body={"chat_template_kwargs": {"enable_thinking": ENABLE_THINKING}},
-                )
-                raw = r.choices[0].message.content or ""
-                last_raw = raw
-                picks = parse_ids(raw, allowed, top_k=5)
-                if len(picks) > len(best_picks):
-                    best_picks = picks
-                if len(best_picks) >= threshold:
-                    break
-                # not enough IDs — backoff and retry
-                backoff = min(2.0 * (attempt + 1), 30.0)
-                time.sleep(backoff)
-            except Exception as e:
-                err = type(e).__name__
-                msg = str(e)[:120]
-                last_raw = f"[Error] {err}: {msg}"
-                if "429" in msg or "rate" in msg.lower():
-                    backoff = 4 * (2 ** attempt) + random.random()
-                    tqdm.write(f"[w{worker_id}] 429, sleep {backoff:.1f}s")
-                    time.sleep(backoff)
-                elif attempt < MAX_RETRIES - 1:
-                    time.sleep(2 + random.random() * 2)
-                else:
-                    tqdm.write(f"[w{worker_id}] ❌ q={q_id_str} give up: {err}: {msg}")
-
-        # Guarantee 5 picks before caching: pad from `allowed_list` (preserves
-        # the original candidate order from build_candidates).
-        if len(best_picks) < 5:
-            seen = set(best_picks)
-            for qid in allowed_list:
-                if qid not in seen:
-                    best_picks.append(qid)
-                    seen.add(qid)
-                    if len(best_picks) >= 5:
-                        break
-        cache[q_id_str] = best_picks[:5]
-        results[q_id_str] = {
-            "q_id": sample["q_id"],
-            "question": sample["question"],
-            "prompt": prompt,
-            "predicted_quotes": best_picks[:5],
-            "model_raw_response": last_raw,
-        }
-
-        if len(cache) % SAVE_EVERY == 0:
-            save_cache(cache)
-            save_results(results)
-        pbar.update(1)
-
-
-# ── 流程 ─────────────────────────────────────────────
-def run_llm_pick(data: List[dict], desc: str) -> Dict[int, List[str]]:
-    cache = load_cache()
-    results = load_results()
-    todo = [s for s in data if len(cache.get(str(s["q_id"]), [])) < 5]
-    full = sum(1 for s in data if len(cache.get(str(s["q_id"]), [])) >= 5)
-    print(f"📥 cached (>=5): {full},  ⏳ todo: {len(todo)} ({desc})")
-    if not todo:
-        return {int(k): v for k, v in cache.items() if int(k) in {s["q_id"] for s in data}}
-
-    def sigh(_s, _f):
-        print("\n⚠️ SIGINT, saving...")
-        STOP.set()
-    signal.signal(signal.SIGINT, sigh)
-
-    shards = [[] for _ in range(NUM_WORKERS)]
-    for i, s in enumerate(todo):
-        shards[i % NUM_WORKERS].append(s)
-
-    pbar = tqdm(total=len(todo), desc=desc)
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
-        futures = [
-            ex.submit(worker, i, shards[i], cache, results, pbar)
-            for i in range(NUM_WORKERS)
-        ]
-        for f in futures:
-            f.result()
-    pbar.close()
-    save_cache(cache)
-    save_results(results)
-    print(f"\n  wall: {time.time()-t0:.1f}s, cached: {len(cache)}")
-    print(f"📝 Per-question raw responses: {RESULTS_PATH}")
-    return {int(k): v for k, v in cache.items() if int(k) in {s["q_id"] for s in data}}
-
-
-def main():
-    train_data = load_train()
-    test_data = load_test()
-    _, dev_subset = split_train_dev(train_data)
-    print(f"📊 Dev: {len(dev_subset)}, Test: {len(test_data)}")
-
-    # ── DEV ────────────────────────────────────────
-    print("\n🔍 Stage 1: dev evaluation")
-    dev_preds = run_llm_pick(dev_subset, "dev")
-    dev_golds = get_gold_quotes_dict(dev_subset)
-    dev_recall = recall_at_k(dev_preds, dev_golds, k=5)
-    print(f"\n📈 Dev Recall@5 (Gemma-4-31B direct) = {dev_recall:.4f}")
-
-    ea = error_analysis(dev_preds, dev_golds, k=5)
-    print(f"  Perfect: {ea['summary']['perfect_count']}")
-    print(f"  Partial: {ea['summary']['partial_count']}")
-    print(f"  Zero:    {ea['summary']['zero_count']}")
-
-    # modality split
-    text_n, img_n = 0, 0
-    for q, lst in dev_preds.items():
-        for qid in lst[:5]:
-            if qid.lower().startswith("image"):
-                img_n += 1
-            else:
-                text_n += 1
-    print(f"  Top-5 modality: text {text_n} ({100*text_n/(text_n+img_n):.1f}%) / img {img_n} ({100*img_n/(text_n+img_n):.1f}%)")
-
-    # ── TEST ─────────────────────────────────────────
-    print("\n🔍 Stage 2: test prediction")
-    test_preds = run_llm_pick(test_data, "test")
-
-    output_dir = config.get_output_dir("phase_6", "gemma_4_31b_direct")
-    submission_path = os.path.join(output_dir, "submission.csv")
-    # pad_short=False → worker 已在快取前補滿到 5，這裡留 False 可在補位邏輯出包時立刻發現
-    generate_submission(test_preds, test_data, submission_path, pad_short=False)
-
-    # 額外把 test 子集的完整回應 dump 一份到 output_dir，方便跟 submission 一起檢視
-    all_results = load_results()
-    test_only = [all_results[str(s["q_id"])] for s in test_data if str(s["q_id"]) in all_results]
-    results_out = os.path.join(output_dir, "gemma_answering_results.json")
-    with open(results_out, "w", encoding="utf-8") as f:
-        json.dump(test_only, f, ensure_ascii=False, indent=2)
-    print(f"📝 Test answering results: {results_out}")
-
-    metrics = {
-        "phase": "phase_6",
-        "model": MODEL,
-        "approach": "direct 15->5 LLM selection (no retriever)",
-        "candidate_caption_source": "original img_description (no VLM)",
-        "dev_recall_at_5": dev_recall,
-        "dev_samples": len(dev_subset),
-        "test_samples": len(test_data),
-        "error_analysis_summary": ea["summary"],
+def query_gemma(prompt: str, api_key: str, timeout: float) -> str:
+    """打一次 API，永遠回傳字串；失敗時回傳 '[Error] ...'。"""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
     }
-    save_metrics(metrics, output_dir)
-    append_leaderboard("Phase 6", f"{MODEL} direct 15->5", dev_recall,
-                       note="pure LLM selection, no retriever")
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2048,
+        "temperature": 0.0,
+        "top_p": 0.1,
+        "stream": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    try:
+        response = requests.post(INVOKE_URL, headers=headers, json=payload, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        if "choices" in data and isinstance(data["choices"], list) and data["choices"]:
+            content = data["choices"][0].get("message", {}).get("content", "")
+            return content.strip() if content else "[Error] 模型回傳了空白內容"
+        return "[Error] API 回應格式不符預期 (無 choices)"
+    except requests.exceptions.RequestException as exc:
+        return f"[Error] API 請求失敗: {exc}"
+    except json.JSONDecodeError:
+        return "[Error] 無法解析 API 傳回的 JSON"
+    except Exception as exc:  # pragma: no cover
+        return f"[Error] 發生未知例外: {exc}"
 
-    print(f"\n✅ Phase 6 完成! 輸出: {output_dir}")
-    print(f"📤 Submission: {submission_path}")
+
+# ---------------------------------------------------------------------------
+# Prompt / parsing
+# ---------------------------------------------------------------------------
+
+ID_PATTERN = re.compile(r"(text|image)[\s\-_]*(\d+)")
+
+
+def extract_top_5_ids(response_text: str, valid_quote_ids: Set[str]) -> List[str]:
+    if not response_text or response_text.startswith("[Error]"):
+        return []
+    seen: Set[str] = set()
+    valid_ids: List[str] = []
+    for prefix, num in ID_PATTERN.findall(response_text.lower()):
+        normalized = f"{prefix}{int(num)}"
+        if normalized in valid_quote_ids and normalized not in seen:
+            valid_ids.append(normalized)
+            seen.add(normalized)
+            if len(valid_ids) == 5:
+                break
+    return valid_ids
+
+
+def build_prompt(question: str, corpus_dict: Dict[str, str]) -> str:
+    # evidence_str = "\n".join(f"[{qid}]: {content}" for qid, content in corpus_dict.items())
+    evidence_str = "\n".join(f"<{qid}>{content}</{qid}>" for qid, content in corpus_dict.items())
+    return (
+        "You are an expert retrieval assistant. I will provide you with a question and a list of evidence items. "
+        "Your task is to analyze the evidence and extract the top 5 most important evidence IDs that best answer the question.\n\n"
+        f"Question: {question}\n\n"
+        f"Evidence Items:\n{evidence_str}\n\n"
+        "You MUST extract and rank EXACTLY 5 evidence IDs in descending order of importance. "
+        "Even if you think fewer than 5 items are relevant, you MUST fill all 5 spots with your best guesses. "
+        "DO NOT output fewer than 5 IDs. Output ONLY the 5 IDs separated by commas (e.g., text1, image3, text5, image2, text10)."
+    )
+
+
+_TEXT_MODALITIES = {"text"}
+_IMAGE_MODALITIES = {"table", "figure", "chart", "image"}
+
+
+def collect_corpus(sample: dict) -> Dict[str, str]:
+    """組成候選證據池。會依 evidence_modality_type 剔除不可能成為答案的型態。
+
+    觀察 train.jsonl 後得到的硬規則：
+      - evidence_modality_type 只含 text → gold 100% 只有 text*
+      - evidence_modality_type 只含 image-like (table/figure/chart) → gold 100% 只有 image*
+    因此在純單一型態的題目，把另一型態的候選整批 prune 掉，可大幅降低 distractor。
+    若 modality 為空或同時含兩者，則完整保留。
+    """
+    mods = set(sample.get("evidence_modality_type") or [])
+    has_text = bool(mods & _TEXT_MODALITIES)
+    has_image = bool(mods & _IMAGE_MODALITIES)
+    # 兩者皆無（modality 缺失或全是未知型態）時 → 不過濾，安全 fallback
+    keep_text = has_text or not (has_text or has_image)
+    keep_image = has_image or not (has_text or has_image)
+
+    corpus: Dict[str, str] = {}
+    if keep_text:
+        for tq in sample.get("text_quotes", []) or []:
+            corpus[tq["quote_id"]] = tq["text"]
+    if keep_image:
+        for iq in sample.get("img_quotes", []) or []:
+            corpus[iq["quote_id"]] = iq["img_description"]
+
+    # 守備：若 filter 後變空但原本有候選 → 回退到不過濾，避免送出空 prompt
+    if not corpus:
+        for tq in sample.get("text_quotes", []) or []:
+            corpus[tq["quote_id"]] = tq["text"]
+        for iq in sample.get("img_quotes", []) or []:
+            corpus[iq["quote_id"]] = iq["img_description"]
+    return corpus
+
+
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+def load_jsonl(path: str) -> List[dict]:
+    if not os.path.exists(path):
+        log(f"[FATAL] 找不到輸入檔 '{path}'")
+        sys.exit(1)
+    samples: List[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                samples.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                log(f"[WARN] 第 {line_no} 行 JSON 解析失敗，跳過: {exc}")
+    return samples
+
+
+def load_existing_results(path: str) -> Dict[int, dict]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {int(r["q_id"]): r for r in data if "q_id" in r}
+    except Exception as exc:
+        log(f"[WARN] 讀取 {path} 失敗，視為空: {exc}")
+        return {}
+
+
+def _atomic_replace(src: str, dst: str, max_retries: int = 8) -> None:
+    """Windows 上 os.replace 偶爾會被防毒/索引器/IDE 短暫鎖住而丟 PermissionError，
+    這裡做指數型 backoff 重試 (100ms ~ 12.8s)。"""
+    delay = 0.1
+    last_exc: Optional[BaseException] = None
+    for _ in range(max_retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(delay)
+            delay = min(delay * 2, 5.0)
+    raise last_exc  # type: ignore[misc]
+
+
+def save_outputs(
+    output_csv: str,
+    backup_json: str,
+    submission_rows: List[dict],
+    results_by_id: Dict[int, dict],
+) -> None:
+    """寫入 CSV 與 JSON。使用臨時檔 + atomic rename，避免寫到一半被中斷造成損毀。"""
+    tmp_csv = output_csv + ".tmp"
+    tmp_json = backup_json + ".tmp"
+
+    pd.DataFrame(submission_rows).to_csv(tmp_csv, index=False)
+    _atomic_replace(tmp_csv, output_csv)
+
+    with open(tmp_json, "w", encoding="utf-8") as f:
+        json.dump(list(results_by_id.values()), f, ensure_ascii=False, indent=2)
+    _atomic_replace(tmp_json, backup_json)
+
+
+# ---------------------------------------------------------------------------
+# Core loop
+# ---------------------------------------------------------------------------
+
+def process_sample(
+    sample: dict,
+    api_key: str,
+    min_quotes: int,
+    max_attempts: int,
+    rate_limiter: RateLimiter,
+    previous_best: Optional[dict] = None,
+) -> dict:
+    """重試直到至少達到 min_quotes，或耗盡 max_attempts；回傳 result dict。"""
+    q_id = sample["q_id"]
+    question = sample["question"]
+    corpus = collect_corpus(sample)
+    valid_ids = set(corpus.keys())
+    prompt = build_prompt(question, corpus)
+    needed = min(min_quotes, max(1, len(valid_ids)))
+
+    if previous_best:
+        best_quotes = list(previous_best.get("predicted_quotes") or [])
+        last_response = previous_best.get("model_raw_response", "")
+    else:
+        best_quotes = []
+        last_response = ""
+
+    for attempt in range(1, max_attempts + 1):
+        rate_limiter.acquire()
+
+        timeout = 180.0 if attempt <= 2 else min(300.0 + 60.0 * (attempt - 3), 600.0)
+        response_text = query_gemma(prompt, api_key, timeout)
+        last_response = response_text
+
+        quotes = extract_top_5_ids(response_text, valid_ids)
+        if len(quotes) > len(best_quotes):
+            best_quotes = quotes
+
+        # 只在錯誤或不達標時輸出，避免洗版 tqdm bar
+        if response_text.startswith("[Error]"):
+            preview = response_text[:120].replace("\n", " ")
+            log(f"[WARN] q_id={q_id} attempt {attempt} error: {preview}")
+        elif len(best_quotes) < needed and attempt == max_attempts:
+            log(f"[WARN] q_id={q_id} 用盡 {max_attempts} 次仍只有 {len(best_quotes)} IDs (門檻 {needed})")
+
+        if len(best_quotes) >= needed:
+            break
+
+        # 指數型 backoff，最高 30 秒（請求節流仍由 RateLimiter 保證）
+        backoff = min(2.0 * attempt, 30.0)
+        time.sleep(backoff)
+
+    return {
+        "q_id": q_id,
+        "question": question,
+        "prompt": prompt,
+        "predicted_quotes": best_quotes,
+        "model_raw_response": last_response,
+    }
+
+
+def _build_submission_rows(samples: List[dict], results_by_id: Dict[int, dict]) -> List[dict]:
+    rows = []
+    for s in samples:
+        q_id = s["q_id"]
+        quotes = list((results_by_id.get(q_id) or {}).get("predicted_quotes") or [])
+        rows.append({"q_id": q_id, "gold_quotes": " ".join(quotes)})
+    return rows
+
+
+def run_pipeline(
+    input_path: str,
+    output_csv: str,
+    backup_json: str,
+    api_key_path: str,
+    min_quotes: int,
+    max_attempts: int,
+    rate_per_minute: int,
+    workers: int,
+    save_every: int,
+) -> None:
+    api_key = load_api_key(api_key_path)
+    samples = load_jsonl(input_path)
+    log(f"載入 {len(samples)} 筆樣本：{input_path}")
+
+    existing = load_existing_results(backup_json)
+    if existing:
+        log(f"偵測到既有結果 {len(existing)} 筆：{backup_json}")
+
+    results_by_id: Dict[int, dict] = dict(existing)
+    results_lock = threading.Lock()
+    save_lock = threading.Lock()
+
+    # 分流：已達門檻 → skip；其餘 → 丟到 thread pool
+    to_process: List[dict] = []
+    skipped = 0
+    for sample in samples:
+        q_id = sample["q_id"]
+        prev = results_by_id.get(q_id)
+        prev_quotes = list(prev.get("predicted_quotes") or []) if prev else []
+        needed = min(min_quotes, max(1, len(collect_corpus(sample))))
+        if prev and len(prev_quotes) >= needed:
+            skipped += 1
+        else:
+            to_process.append(sample)
+
+    log(f"沿用 {skipped} 筆；需要重打 {len(to_process)} 筆")
+    log(f"並行 worker 數: {workers}，全域 rate limit: {rate_per_minute} calls / 60s")
+
+    rate_limiter = RateLimiter(max_calls=rate_per_minute, window_seconds=60.0)
+
+    completed = 0
+    total = len(to_process)
+
+    def _worker(sample: dict) -> int:
+        q_id = sample["q_id"]
+        with results_lock:
+            prev = results_by_id.get(q_id)
+        prev_quotes = list((prev or {}).get("predicted_quotes") or [])
+        try:
+            result = process_sample(
+                sample,
+                api_key=api_key,
+                min_quotes=min_quotes,
+                max_attempts=max_attempts,
+                rate_limiter=rate_limiter,
+                previous_best=prev,
+            )
+        except Exception as exc:  # pragma: no cover
+            log(f"[WARN] q_id={q_id} 發生例外，保留舊值: {exc}")
+            result = prev or {
+                "q_id": q_id,
+                "question": sample.get("question", ""),
+                "prompt": "",
+                "predicted_quotes": prev_quotes,
+                "model_raw_response": "",
+            }
+        with results_lock:
+            results_by_id[q_id] = result
+        return len(list(result.get("predicted_quotes") or []))
+
+    below_threshold: List[int] = []
+
+    if to_process:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor, \
+                tqdm(total=len(samples), initial=skipped, desc="處理", unit="q",
+                     dynamic_ncols=True) as bar:
+            bar.set_postfix(skip=skipped, low=0)
+            future_to_sample = {
+                executor.submit(_worker, sample): sample for sample in to_process
+            }
+            for future in concurrent.futures.as_completed(future_to_sample):
+                sample = future_to_sample[future]
+                q_id = sample["q_id"]
+                try:
+                    n_ids = future.result()
+                except Exception as exc:  # pragma: no cover
+                    log(f"[WARN] q_id={q_id} worker 失敗: {exc}")
+                    n_ids = 0
+
+                needed = min(min_quotes, max(1, len(collect_corpus(sample))))
+                if n_ids < needed:
+                    below_threshold.append(q_id)
+
+                completed += 1
+                bar.set_postfix(skip=skipped, low=len(below_threshold))
+                bar.update(1)
+
+                if completed % save_every == 0 or completed == total:
+                    with save_lock, results_lock:
+                        rows = _build_submission_rows(samples, results_by_id)
+                        try:
+                            save_outputs(output_csv, backup_json, rows, results_by_id)
+                        except Exception as exc:
+                            # 寫檔暫時失敗（多半是 Windows 檔案鎖）→ 下一筆完成時會再試
+                            log(f"[WARN] 寫檔失敗，跳過此次 flush，下次再試: {exc}")
+
+    # 最終再存一次，確保即使全部 skip 也會寫出檔
+    with save_lock, results_lock:
+        rows = _build_submission_rows(samples, results_by_id)
+        try:
+            save_outputs(output_csv, backup_json, rows, results_by_id)
+        except Exception as exc:
+            log(f"[WARN] 最終寫檔失敗，請手動重跑: {exc}")
+
+    log("\n" + "=" * 60)
+    log(f"完成。樣本總數 {len(samples)}：沿用 {skipped} 筆 / 重打 {len(to_process)} 筆")
+    log(f"輸出：{output_csv}")
+    log(f"備份：{backup_json}")
+    if below_threshold:
+        log(f"[WARN] 仍未達門檻 {min_quotes} 的 q_id 共 {len(below_threshold)} 筆：{below_threshold[:30]}"
+            + (" ..." if len(below_threshold) > 30 else ""))
+        log("       直接再執行一次本腳本即可從這些 q_id 繼續重試。")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="RAG submission pipeline (NVIDIA Gemma)")
+    parser.add_argument("--input", default=os.path.join("data", "test.jsonl"),
+                        help="輸入的 JSONL 檔 (預設 data/test.jsonl)")
+    parser.add_argument("--output-dir", default=None,
+                        help="輸出資料夾 (預設 outputs/phase_6/{model_slug}_{mmddhhmm})")
+    parser.add_argument("--output", default="submission.csv",
+                        help="輸出 CSV 檔名，會放進 --output-dir (預設 submission.csv)")
+    parser.add_argument("--backup", default="gemma_answering_results.json",
+                        help="完整回應備份 JSON，會放進 --output-dir (預設 gemma_answering_results.json)")
+    parser.add_argument("--api-key", default="api_key.txt", help="API key 檔路徑 (預設 api_key.txt)")
+    parser.add_argument("--min-quotes", type=int, default=5,
+                        help="每筆至少要拿到的 ID 數，未達會持續重試 (預設 5)")
+    parser.add_argument("--max-attempts", type=int, default=12,
+                        help="同一筆最多重試幾次 (預設 12)")
+    parser.add_argument("--rate", type=int, default=37,
+                        help="60 秒滑動視窗內最多 API 呼叫次數 (預設 37，NIM 上限為 40)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="並行 worker 執行緒數 (預設 4)")
+    parser.add_argument("--save-every", type=int, default=1,
+                        help="每完成 N 筆就 flush 到磁碟 (預設 1，每筆都即時寫檔最安全)")
+    return parser.parse_args()
+
+
+def main() -> None:
+    _configure_stdout()
+    args = parse_args()
+
+    output_dir = args.output_dir or default_output_dir()
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_csv = args.output if os.path.isabs(args.output) else os.path.join(output_dir, args.output)
+    backup_json = args.backup if os.path.isabs(args.backup) else os.path.join(output_dir, args.backup)
+
+    log(f"輸出資料夾: {output_dir}")
+
+    run_pipeline(
+        input_path=args.input,
+        output_csv=output_csv,
+        backup_json=backup_json,
+        api_key_path=args.api_key,
+        min_quotes=args.min_quotes,
+        max_attempts=args.max_attempts,
+        rate_per_minute=args.rate,
+        workers=args.workers,
+        save_every=args.save_every,
+    )
 
 
 if __name__ == "__main__":
